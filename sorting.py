@@ -12,7 +12,7 @@ import faiss
 from scipy.sparse import csr_matrix, coo_matrix
 from scipy.sparse.csgraph import minimum_spanning_tree, depth_first_order, connected_components
 
-from cli import ARG_BATCH_SIZE, ARG_INDEX_FILE, ARG_LIST_ONLY, ARG_LOG_LEVEL, ARG_LOOKAHEAD, ARG_NEIGHBORS_K_LIMIT, ARG_OUT_TSV, ARG_TSV_NEIGHBORS,ARG_TWO_OPT_BLOCK_SIZE,ARG_SORT_OPTIMIZER,ARG_TWO_OPT_SHIFT, ARG_USE_CPU
+from config import Config
 from faiss_io import save_faiss_index
 from cli import LOGGER
 from search import compute_global_knn
@@ -103,7 +103,7 @@ def optimized_depth_first_order(mst, i_start, lookahead_depth, progress_callback
     return np.array(path), visited
 
 
-def sort_by_ann_mst(feats: np.ndarray, k: int, batch_size: int = ARG_BATCH_SIZE, use_gpu: bool = False, optimizer: str = ARG_SORT_OPTIMIZER, block_size: int = ARG_TWO_OPT_BLOCK_SIZE, shift: int = ARG_TWO_OPT_SHIFT):
+def sort_by_ann_mst(feats: np.ndarray, k: int, config: Config):
     """
     Улучшенная сортировка на основе MST с обработкой несвязных графов ("островов").
     Использует ЕВКЛИДОВО (L2) РАССТОЯНИЕ.
@@ -133,9 +133,9 @@ def sort_by_ann_mst(feats: np.ndarray, k: int, batch_size: int = ARG_BATCH_SIZE,
     LOGGER.info(f"  - Изображений: {n}")
     LOGGER.info(f"  - Размерность фичей: {d}")
     LOGGER.info(f"  - Соседей на точку (k): {k}")
-    LOGGER.info(f"  - Размер батча: {batch_size}")
-    LOGGER.info(f"  - Использовать GPU: {use_gpu}")
-    LOGGER.info(f"  - Оптимизатор: {optimizer} (block_size={block_size}, shift={shift})")
+    LOGGER.info(f"  - Размер батча: {config.search.global_knn_batch_size}")
+    LOGGER.info(f"  - Использовать GPU: {config.model.use_gpu}")
+    LOGGER.info(f"  - Оптимизатор: {config.search.optimizer} (block_size={config.sorting.two_opt_block_size}, shift={config.sorting.two_opt_shift})")
     LOGGER.info("="*80)
 
     # Работаем с копией float32 для FAISS
@@ -151,7 +151,7 @@ def sort_by_ann_mst(feats: np.ndarray, k: int, batch_size: int = ARG_BATCH_SIZE,
         # ИЗМЕНЕНИЕ 2: Используем IndexFlatL2 для евклидова расстояния вместо IndexFlatIP.
         index = faiss.IndexFlatL2(d)
 
-        if use_gpu and torch is not None and torch.cuda.is_available():
+        if config.model.use_gpu and torch is not None and torch.cuda.is_available():
             LOGGER.info("  - Попытка использовать GPU для FAISS...")
             res = faiss.StandardGpuResources()
             index = faiss.index_cpu_to_gpu(res, 0, index)
@@ -170,8 +170,8 @@ def sort_by_ann_mst(feats: np.ndarray, k: int, batch_size: int = ARG_BATCH_SIZE,
     try:
         all_distances = []
         all_indices = []
-        for i in tqdm(range(0, n, batch_size), desc="  - Поиск k-NN (батчи)"):
-            end = min(i + batch_size, n)
+        for i in tqdm(range(0, n, config.search.global_knn_batch_size), desc="  - Поиск k-NN (батчи)"):
+            end = min(i + config.search.global_knn_batch_size, n)
             # Ищем k+1 соседа, так как первый результат - это сама точка
             distances_batch, indices_batch = index.search(feats_copy[i:end], k + 1)
             all_distances.append(distances_batch)
@@ -254,7 +254,7 @@ def sort_by_ann_mst(feats: np.ndarray, k: int, batch_size: int = ARG_BATCH_SIZE,
             
             start_node = main_nodes_indices[0]
             
-            LOOKAHEAD_DEPTH = ARG_LOOKAHEAD # Можете менять это значение, оно почти ни на что не влияет так как график строится жадно без ветвлений (например, 30, 50, 100, 0/1=выкл)
+            LOOKAHEAD_DEPTH = config.sorting.lookahead # Можете менять это значение, оно почти ни на что не влияет так как график строится жадно без ветвлений (например, 30, 50, 100, 0/1=выкл)
             
             # --- ГЛАВНЫЙ ПЕРЕКЛЮЧАТЕЛЬ АЛГОРИТМОВ ---
             if LOOKAHEAD_DEPTH <= 1:
@@ -309,7 +309,7 @@ def sort_by_ann_mst(feats: np.ndarray, k: int, batch_size: int = ARG_BATCH_SIZE,
             LOGGER.info(f"    - [2.1/2.4] Поиск соседей для {num_islands}...")
             island_k = min(1000, num_islands - 1) # k не может быть больше N-1
             island_index = faiss.IndexFlatL2(island_feats.shape[1])
-            if use_gpu: # Предполагается, что use_gpu определена ранее
+            if config.model.use_gpu: # Предполагается, что use_gpu определена ранее
                 res = faiss.StandardGpuResources()
                 island_index = faiss.index_cpu_to_gpu(res, 0, island_index)
             island_index.add(island_feats)
@@ -378,7 +378,7 @@ def sort_by_ann_mst(feats: np.ndarray, k: int, batch_size: int = ARG_BATCH_SIZE,
    
     # --- Шаг 6: Пост-обработка пути с оптимизатором ---
     step_start_time = time.time()
-    LOGGER.info(f"\n[6/6] Шаг 6: Пост-обработка пути с {optimizer} (блоки {block_size}, сдвиг {shift})...")
+    LOGGER.info(f"\n[6/6] Шаг 6: Пост-обработка пути с {config.search.optimizer} (блоки {config.sorting.two_opt_block_size}, сдвиг {config.sorting.two_opt_shift})...")
     
     # Вспомогательные функции для оптимизаторов
     def compute_distance_matrix(sub_feats):
@@ -413,11 +413,11 @@ def sort_by_ann_mst(feats: np.ndarray, k: int, batch_size: int = ARG_BATCH_SIZE,
     
     # Разбиение на overlapping блоки и оптимизация
     optimized_path = path.copy()
-    num_blocks = max(1, (n - block_size) // shift + 1)
+    num_blocks = max(1, (n - config.sorting.two_opt_block_size) // config.sorting.two_opt_shift + 1)
     
     for b in tqdm(range(num_blocks), desc="  - Оптимизация блоков"):
-        start = b * shift
-        end = min(start + block_size, n)
+        start = b * config.sorting.two_opt_shift
+        end = min(start + config.sorting.two_opt_block_size, n)
         if end - start < 3:
             continue
         
@@ -428,7 +428,7 @@ def sort_by_ann_mst(feats: np.ndarray, k: int, batch_size: int = ARG_BATCH_SIZE,
         # Для простоты здесь всегда считаем их фиксированными, т.к. они соединяются с остальной частью пути.
         # Если нужна особая логика для крайних блоков, ее можно добавить сюда.
         
-        if optimizer == '2opt':
+        if config.search.optimizer == '2opt':
             optimized_path[start:end] = two_opt(subpath, sub_feats)
 
     
@@ -445,7 +445,7 @@ def sort_by_ann_mst(feats: np.ndarray, k: int, batch_size: int = ARG_BATCH_SIZE,
     
     return path
 
-def sort_images(feats, paths, out_folder):
+def sort_images(feats, paths, config: Config):
     n = feats.shape[0]
     if n < 1:
         LOGGER.info("Нет изображений для сортировки.")
@@ -458,12 +458,12 @@ def sort_images(feats, paths, out_folder):
     LOGGER.info(f"Всего изображений: {n}")
 
     # Подбираем разумное k для внутреннего графа (как раньше)
-    if len(paths) < ARG_NEIGHBORS_K_LIMIT:
+    if len(paths) < config.sorting.neighbors_k_limit:
         k_neighbors = len(paths) - 1
     else:
-        k_neighbors = ARG_NEIGHBORS_K_LIMIT
+        k_neighbors = config.sorting.neighbors_k_limit
 
-    use_gpu_faiss = not ARG_USE_CPU and torch.cuda.is_available()
+    use_gpu_faiss = not config.model.use_cpu and torch.cuda.is_available()
     final_order = sort_by_ann_mst(feats, k=k_neighbors, use_gpu=use_gpu_faiss)
 
     if final_order is None or len(final_order) == 0:
@@ -481,22 +481,22 @@ def sort_images(feats, paths, out_folder):
     index.add(ordered_feats.astype('float32', copy=False))
     
     # сохраняем индекс
-    save_faiss_index(index,ARG_INDEX_FILE)
+    save_faiss_index(index,config.files.index_file,config)
     
     # сохраняем mapping (faiss position -> original index)
-    np.save(ARG_INDEX_FILE + ".order.npy", ordered_indices)   # файл: faiss.index.order.npy
+    np.save(config.files.index_file + ".order.npy", ordered_indices)   # файл: faiss.index.order.npy
     
     # (опционально) сохраним также список путей в том же порядке — удобно для отладки
     ordered_paths = [paths[i] for i in ordered_indices]
-    with open(ARG_INDEX_FILE + ".paths.txt", "w", encoding="utf-8") as f:
+    with open(config.files.index_file + ".paths.txt", "w", encoding="utf-8") as f:
         for p in ordered_paths:
             f.write(p + "\n")
 
 
     # Если пользователь запросил только список — формируем TSV с глобальными соседями
-    if ARG_LIST_ONLY:
+    if config.files.list_only:
         # Вычисляем глобальные k-NN (по всей базе). Используем args.neighbors
-        knn_k = max(1, ARG_TSV_NEIGHBORS)
+        knn_k = max(1, config.search.tsv_neighbors)  # минимум 1 сосед
         LOGGER.info(f"\nВычисляем глобальные {knn_k} ближайших соседей и формируем файл...")
 
         # Сначала постройте таблицу обратной индексации: original_index -> position in final order
@@ -505,9 +505,9 @@ def sort_images(feats, paths, out_folder):
             inverse_order[orig_idx] = pos
 
         # Выполняем глобальный поиск соседей (возвращаются индексы по оригинальным индексам)
-        knn_idxs, knn_dists = compute_global_knn(feats, knn_k, batch_size=ARG_BATCH_SIZE, use_gpu=use_gpu_faiss)
+        knn_idxs, knn_dists = compute_global_knn(feats, knn_k, config.search.global_knn_batch_size, use_gpu=use_gpu_faiss)
 
-        out_file = ARG_OUT_TSV
+        out_file = config.files.out_tsv
         # Записываем в TSV потоково
         with open(out_file, "w", encoding="utf-8") as f:
             f.write("path\tindex\tdistance\n")
@@ -532,5 +532,5 @@ def sort_images(feats, paths, out_folder):
         return
 
     # Если list_only не указан — поведение прежнее: копируем файлы в out_folder
-    copy_and_rename(paths, final_order, out_folder)
+    copy_and_rename(paths, final_order, config.files.dst_folder)
     LOGGER.info("Сортировка завершена.")

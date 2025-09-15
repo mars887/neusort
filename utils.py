@@ -31,7 +31,7 @@ def copy_and_rename(paths, order, out_folder):
 
     LOGGER.info(f"Копирование завершено.")
 
-def output_sequence_with_neighbors(paths, feats, order, neighbors=3, out_file=None):
+def output_sequence_with_neighbors(paths, feats, order, neighbors, out_file=None):
     """
     Выводит (или сохраняет) последовательность файлов в порядке `order` и
     для каждой позиции показывает до `neighbors` соседей слева и справа

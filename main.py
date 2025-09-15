@@ -6,7 +6,6 @@ import faiss
 import numpy as np
 import torch
 
-from cli import ARG_MODEL_NAME, ARG_MORE_SCAN, ARG_SRC_FOLDER, ARG_LOG_LEVEL, ARG_FIND, ARG_USE_CPU, ARG_FIND_NEIGHBORS, ARG_INDEX_FILE, ARG_DST_FOLDER
 from database import load_features_from_db, process_and_cache_features
 from faiss_io import load_faiss_index
 from features import extract_feature
@@ -15,25 +14,26 @@ from search import find_and_print_neighbors_simple, find_and_print_neighbors_sim
 from sorting import sort_images
 
 from cli import LOGGER
+from cli import CONFIG
 
 # ---------------------------------------------------------------------------- #
 #                                    Main                                      #
 # ---------------------------------------------------------------------------- #
 if __name__ == "__main__":
     # --- ЛОГИКА СОЗДАНИЯ ИМЕНИ БАЗЫ ДАННЫХ ---
-    safe_model_name = ARG_MODEL_NAME.replace("/", "_")
-    scan_suffix = "_more_scan" if ARG_MORE_SCAN else ""
+    safe_model_name = CONFIG.model.model_name.replace("/", "_")
+    scan_suffix = "_more_scan" if CONFIG.model.more_scan else ""
     DB_FILE = f"features_db_{safe_model_name}{scan_suffix}.sqlite"
 
     # Убедимся, что папка с исходниками есть
-    if not os.path.isdir(ARG_SRC_FOLDER):
-        LOGGER.error(f"Создайте папку {ARG_SRC_FOLDER} и положите туда картинки.")
-        os.makedirs(ARG_SRC_FOLDER, exist_ok=True)
+    if not os.path.isdir(CONFIG.files.src_folder):
+        LOGGER.error(f"Создайте папку {CONFIG.files.src_folder} и положите туда картинки.")
+        os.makedirs(CONFIG.files.src_folder, exist_ok=True)
         exit(1)
 
     # 2. Создаем или обновляем базу данных с признаками
     # Эта функция сама найдет новые файлы и обработает только их
-    process_and_cache_features(DB_FILE, ARG_SRC_FOLDER, more_scan=ARG_MORE_SCAN)
+    process_and_cache_features(DB_FILE, CONFIG.files.src_folder, more_scan=CONFIG.model.more_scan)
 
     # 3. Загружаем ВСЕ актуальные признаки из базы для сортировки
     LOGGER.info("Загружаем все признаки из базы данных для начала сортировки...")
@@ -41,20 +41,20 @@ if __name__ == "__main__":
 
     if paths and feats is not None and len(paths) > 0:
         # Определим, будем ли использовать GPU для индекса FAISS
-        use_gpu_faiss = (not ARG_USE_CPU) and torch.cuda.is_available()
+        use_gpu_faiss = (not CONFIG.model.use_cpu) and torch.cuda.is_available()
 
         # Если режим --find: Загружаем индекс с диска и ищем
-        if ARG_FIND:
+        if CONFIG.search.find:
 
-            use_gpu_faiss = (not ARG_USE_CPU) and torch.cuda.is_available()
+            use_gpu_faiss = (not CONFIG.model.use_cpu) and torch.cuda.is_available()
 
             # Загружаем индекс и mapping
-            if not os.path.exists(ARG_INDEX_FILE):
-                LOGGER.error(f"! Индекс не найден: {ARG_INDEX_FILE}. Сначала запустите без --find, чтобы его построить.")
+            if not os.path.exists(CONFIG.files.index_file):
+                LOGGER.error(f"! Индекс не найден: {CONFIG.files.index_file}. Сначала запустите без --find, чтобы его построить.")
                 exit(2)
 
-            index = load_faiss_index(ARG_INDEX_FILE, use_gpu=use_gpu_faiss)
-            order_map = np.load(ARG_INDEX_FILE + ".order.npy")  # faiss_pos -> original_idx
+            index = load_faiss_index(CONFIG.files.index_file, use_gpu=use_gpu_faiss)
+            order_map = np.load(CONFIG.files.index_file + ".order.npy")  # faiss_pos -> original_idx
 
             # Загрузим список путей и фич в original порядке
             feats, paths = load_features_from_db(DB_FILE)
@@ -89,7 +89,7 @@ if __name__ == "__main__":
                     return "NOT_IN_INDEX", orig_idx, None
                 pos_in_faiss = int(pos_arr[0])
 
-                k = max(1, ARG_FIND_NEIGHBORS)
+                k = max(1, CONFIG.search.find_NEIGHBORS)
                 kk = min(k + 1, feats_f32.shape[0])
                 D, I = index.search(feats_f32[orig_idx:orig_idx+1], kk)
                 D = np.sqrt(D)
@@ -103,26 +103,24 @@ if __name__ == "__main__":
                 return orig_idx, pos_in_faiss, neighbors
 
             # --- Режим одиночного запроса ---
-            if ARG_FIND != "__PIPE__":
-                target = ARG_FIND
+            if CONFIG.search.find != "__PIPE__":
+                target = CONFIG.search.find
                 orig_idx, pos, neighbors = find_neighbors_for_path(target)
                 if orig_idx is None:
-                    target = ARG_FIND
+                    target = CONFIG.search.find
 
                 # Сначала пытаемся найти в БД (как у вас уже реализовано)
                 orig_idx, pos, neighbors = find_neighbors_for_path(target)
                                 # --- Внешний файл (не найден в БД) — выводим 2 варианта ---
                 if orig_idx is None:
-                    target = ARG_FIND
-                    if ARG_LOG_LEVEL == "default":
-                        print(f"'{target}' не найден в БД — пробуем как внешнюю картинку...")
+                    target = CONFIG.search.find
+                    LOGGER.info(f"'{target}' не найден в БД — пробуем как внешнюю картинку...")
 
                     # Проверки наличия сохранённых вспомогательных файлов
-                    order_npy = ARG_INDEX_FILE + ".order.npy"
-                    paths_txt = ARG_INDEX_FILE + ".paths.txt"
-                    if (not os.path.exists(ARG_INDEX_FILE)) or (not os.path.exists(paths_txt)) or (not os.path.exists(order_npy)):
-                        if ARG_LOG_LEVEL in ("default", "error"):
-                            print("! Для расширенного внешнего поиска требуется существующий faiss.index, .order.npy и .paths.txt (перестройте индекс).")
+                    order_npy = CONFIG.files.index_file + ".order.npy"
+                    paths_txt = CONFIG.files.index_file + ".paths.txt"
+                    if (not os.path.exists(CONFIG.files.index_file)) or (not os.path.exists(paths_txt)) or (not os.path.exists(order_npy)):
+                        LOGGER.error("! Для расширенного внешнего поиска требуется существующий faiss.index, .order.npy и .paths.txt (перестройте индекс).")
                         exit(2)
 
                     # Подгружаем список путей в порядке FAISS (faiss_pos -> path)
@@ -134,12 +132,12 @@ if __name__ == "__main__":
 
                     # Загружаем модель и извлекаем фичи для запроса
                     try:
-                        model, hook = load_model(ARG_MODEL_NAME)
+                        model, hook = load_model(CONFIG.model.model_name)
                     except Exception as e:
                         print(f"! Не удалось загрузить модель для извлечения признаков: {e}")
                         exit(11)
                     try:
-                        qfeat = extract_feature(target, model, hook, more_scan=ARG_MORE_SCAN)
+                        qfeat = extract_feature(target, model, hook, more_scan=CONFIG.model.more_scan)
                         if qfeat is None:
                             print(f"! Не удалось извлечь признаки для {target}")
                             exit(12)
@@ -150,7 +148,7 @@ if __name__ == "__main__":
                     q = qfeat.astype('float32').reshape(1, -1)
 
                     # 1) Глобальный поиск по FAISS — получаем позиции и расстояния
-                    k = max(1, ARG_FIND_NEIGHBORS)
+                    k = max(1, CONFIG.search.find_NEIGHBORS)
                     kk = min(k, max(1, index.ntotal))
                     try:
                         Dq, Iq = index.search(q, kk)
@@ -204,12 +202,12 @@ if __name__ == "__main__":
                         feats=feats,
                         paths=paths,
                         query_path=target,
-                        k=ARG_FIND_NEIGHBORS,
+                        k=CONFIG.search.find_NEIGHBORS,
                         qvec=qfeat.astype('float32').reshape(1,-1),
                         extract_feature_fn=extract_feature,      # можно передать, но не используется, т.к. qvec передан
                         load_model_fn=load_model,                # тоже не нужен в этом вызове
-                        model_name=ARG_MODEL_NAME,
-                        more_scan=ARG_MORE_SCAN
+                        model_name=CONFIG.model.model_name,
+                        more_scan=CONFIG.model.more_scan
                     )
 
                     try:
@@ -226,31 +224,30 @@ if __name__ == "__main__":
                     print(f"{target}\t-1\tNOT_INDEXED")
                 else:
                     print_neighbors_indexed(paths,orig_idx,pos,neighbors)
-                    find_and_print_neighbors_simple(ARG_INDEX_FILE,feats,paths,target,ARG_FIND_NEIGHBORS,use_gpu_faiss)
+                    find_and_print_neighbors_simple(CONFIG.files.index_file,feats,paths,target,CONFIG.search.find_NEIGHBORS,use_gpu_faiss)
                 exit(0)
 
             # --- Режим pipeline ---
             # ------------------ Pipeline: чтение путей из stdin (замена) ------------------
 
             # Проверки наличия индекса и маппингов
-            order_npy = ARG_INDEX_FILE + ".order.npy"
-            paths_txt = ARG_INDEX_FILE + ".paths.txt"
-            if (not os.path.exists(ARG_INDEX_FILE)) or (not os.path.exists(paths_txt)) or (not os.path.exists(order_npy)):
-                if ARG_LOG_LEVEL in ("default", "error"):
-                    print("! Для pipeline требуется существующий faiss.index, .order.npy и .paths.txt (перестройте индекс).")
+            order_npy = CONFIG.files.index_file + ".order.npy"
+            paths_txt = CONFIG.files.index_file + ".paths.txt"
+            if (not os.path.exists(CONFIG.files.index_file)) or (not os.path.exists(paths_txt)) or (not os.path.exists(order_npy)):
+                LOGGER.error("! Для pipeline требуется существующий faiss.index, .order.npy и .paths.txt (перестройте индекс).")
                 exit(2)
 
             # Загрузка индекса и вспомогательных маппингов один раз
-            index = load_faiss_index(ARG_INDEX_FILE, use_gpu=use_gpu_faiss)
+            index = load_faiss_index(CONFIG.files.index_file, use_gpu=use_gpu_faiss)
             with open(paths_txt, "r", encoding="utf-8") as f:
                 faiss_pos_to_path = [line.strip() for line in f]
             order_map = np.load(order_npy)  # faiss_pos -> original_idx
 
             # Загрузим модель и hook один раз для всех внешних изображений
             try:
-                model, hook = load_model(ARG_MODEL_NAME)
+                model, hook = load_model(CONFIG.model.model_name)
             except Exception as e:
-                print(f"! Не удалось загрузить модель для pipeline: {e}")
+                LOGGER.error(f"! Не удалось загрузить модель для pipeline: {e}")
                 exit(11)
 
             LOGGER.info("Pipeline mode started. Enter image paths (Ctrl+D/Ctrl+C to stop):", file=sys.stderr)
@@ -268,7 +265,7 @@ if __name__ == "__main__":
                 if orig_idx is None:
                     # внешний — извлекаем признаки напрямую (переиспользуем модель)
                     try:
-                        qfeat = extract_feature(qpath, model, hook, more_scan=ARG_MORE_SCAN)
+                        qfeat = extract_feature(qpath, model, hook, more_scan=CONFIG.model.more_scan)
                         if qfeat is None:
                             LOGGER.error(f"{qpath}\t-1\tERROR_EXTRACT")
                             continue
@@ -279,7 +276,7 @@ if __name__ == "__main__":
                     q = qfeat.astype('float32').reshape(1, -1)
 
                     # Выполняем поиск в FAISS
-                    k = max(1, ARG_FIND_NEIGHBORS)
+                    k = max(1, CONFIG.search.find_NEIGHBORS)
                     kk = min(k, max(1, index.ntotal))
                     try:
                         Dq, Iq = index.search(q, kk)
@@ -326,12 +323,12 @@ if __name__ == "__main__":
                         feats=feats,
                         paths=paths,
                         query_path=qpath,
-                        k=ARG_FIND_NEIGHBORS,
+                        k=CONFIG.search.find_NEIGHBORS,
                         qvec=qfeat.astype('float32').reshape(1,-1),
                         extract_feature_fn=extract_feature,      # можно передать, но не используется, т.к. qvec передан
                         load_model_fn=load_model,                # тоже не нужен в этом вызове
-                        model_name=ARG_MODEL_NAME,
-                        more_scan=ARG_MORE_SCAN,
+                        model_name=CONFIG.model.model_name,
+                        more_scan=CONFIG.model.more_scan,
                     )
 
                 elif orig_idx == "AMBIGUOUS":
@@ -341,7 +338,7 @@ if __name__ == "__main__":
                 else:
                     # найден в БД — печатаем оба варианта (как вы просили)
                     print_neighbors_indexed(paths, orig_idx, pos, neighbors)
-                    find_and_print_neighbors_simple(ARG_INDEX_FILE, feats, paths, qpath, ARG_FIND_NEIGHBORS, use_gpu_faiss)
+                    find_and_print_neighbors_simple(CONFIG.files.index_file, feats, paths, qpath, CONFIG.search.find_NEIGHBORS, use_gpu_faiss)
 
             # Очистка модели / VRAM
             try:
@@ -371,4 +368,4 @@ if __name__ == "__main__":
 
             # дальше — стандартная сортировка/поведение скрипта
             LOGGER.info(f"Всего в работе {len(paths)} изображений. Начинаем сортировку...")
-            sort_images(feats, paths, ARG_DST_FOLDER)
+            sort_images(feats, paths, CONFIG.files.dst_folder)

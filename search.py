@@ -4,13 +4,13 @@ import numpy as np
 import torch
 from tqdm.auto import tqdm
 
-from cli import ARG_BATCH_SIZE, ARG_LOG_LEVEL
 from faiss_io import load_faiss_index
 from cli import LOGGER
 from models import load_model
+from config import Config     
 
 
-def compute_global_knn(feats: np.ndarray, k: int, batch_size: int = ARG_BATCH_SIZE, use_gpu: bool = False):
+def compute_global_knn(feats: np.ndarray, k: int, config: Config, use_gpu: bool = False):
     """
     Для каждого вектора из feats возвращает k ближайших соседей по всей базе (по L2).
     Возвращает два массива:
@@ -35,8 +35,8 @@ def compute_global_knn(feats: np.ndarray, k: int, batch_size: int = ARG_BATCH_SI
     knn_idxs = np.full((n, k), -1, dtype=np.int64)
     knn_dists = np.full((n, k), np.inf, dtype=np.float32)
 
-    for i in tqdm(range(0, n, batch_size), desc="  - Global k-NN search (batched)"):
-        end = min(n, i + batch_size)
+    for i in tqdm(range(0, n, config.search.global_knn_batch_size), desc="  - Global k-NN search (batched)"):
+        end = min(n, i + config.search.global_knn_batch_size)
         D, I = index.search(feats_f32[i:end], knn_k)  # D: квадраты L2
         # Для каждой строки удаляем саму точку и берем первые k
         for r in range(end - i):
@@ -267,7 +267,6 @@ def find_and_print_neighbors_simple_extended(
     paths,                   # list всех путей в original order
     query_path,              # путь к картинке (может быть внешней)
     k=5,
-    use_gpu=False,
     extract_feature_fn=None, # функция extract_feature(path, model, hook, more_scan)
     load_model_fn=None,      # функция load_model(model_name) -> (model, hook)
     model_name=None,

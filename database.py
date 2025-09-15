@@ -8,15 +8,14 @@ import sqlite3
 
 import numpy as np
 import torch
-from tqdm.auto import tqdm
-from cli import ARG_IMAGE_BATCH_SIZE, ARG_LOG_LEVEL,ARG_MODEL_NAME
-from features import extract_feature
+from tqdm.auto import tqdm 
+from features import extract_feature, Config
 from cli import LOGGER
 from models import load_model
 
 
-def process_and_cache_features(db_file, src_folder, more_scan, batch_size=ARG_IMAGE_BATCH_SIZE):
-    """
+def process_and_cache_features(db_file, config: Config):
+    """Config
     Универсальная функция для создания и обновления базы данных с признаками.
 
     Сканирует папку, находит файлы, отсутствующие в базе, обрабатывает их
@@ -52,7 +51,7 @@ def process_and_cache_features(db_file, src_folder, more_scan, batch_size=ARG_IM
         # 2. Получаем актуальный список файлов на диске
         supported_exts = (".jpg", ".jpeg", ".png", ".bmp", ".webp", ".jfif")
         current_paths_on_disk = {
-            os.path.join(src_folder, fn) for fn in os.listdir(src_folder)
+            os.path.join(config.files.src_folder, fn) for fn in os.listdir(config.files.src_folder)
             if fn.lower().endswith(supported_exts)
         }
 
@@ -63,20 +62,20 @@ def process_and_cache_features(db_file, src_folder, more_scan, batch_size=ARG_IM
             LOGGER.info("База данных актуальна. Новых файлов для обработки не найдено.")
             return
         
-        model, hook = load_model(ARG_MODEL_NAME)
+        model, hook = load_model(config.model.model_name)
 
         LOGGER.info(f"Найдено {len(paths_to_process)} новых изображений для обработки.")
         
         # 4. Обрабатываем новые файлы пакетами
-        for i in range(0, len(paths_to_process), batch_size):
-            batch_paths = paths_to_process[i:i + batch_size]
+        for i in range(0, len(paths_to_process), config.model.batch_size):
+            batch_paths = paths_to_process[i:i + config.model.batch_size]
             batch_feats_data = []
             
-            desc_text = f"Обработка пакета {i//batch_size + 1}/{(len(paths_to_process) + batch_size - 1)//batch_size}"
+            desc_text = f"Обработка пакета {i//config.model.batch_size + 1}/{(len(paths_to_process) + config.model.batch_size - 1)//config.model.batch_size}"
             
             for full_path in tqdm(batch_paths, desc=desc_text):
                 try:
-                    feat = extract_feature(full_path, model, hook, more_scan=more_scan)
+                    feat = extract_feature(full_path, model, hook, config)
                     if feat is not None:
                         # Готовим данные для вставки в БД
                         safe_path = full_path.encode('utf-8', errors='replace').decode('utf-8')

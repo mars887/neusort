@@ -2,10 +2,10 @@
 import os
 import faiss
 
-from cli import ARG_LOG_LEVEL, LOGGER
+from cli import LOGGER, Config
 
 
-def save_faiss_index(index, index_path):
+def save_faiss_index(index, index_path,config: Config):
     """
     Сохраняет faiss индекс на диск атомарно.
     Если индекс на GPU — сначала переводит его в CPU.
@@ -29,18 +29,18 @@ def save_faiss_index(index, index_path):
             try: os.remove(tmp_path)
             except: pass
 
-def load_faiss_index(index_path, use_gpu=False, gpu_id=0):
+def load_faiss_index(index_path, config: Config):
     """
     Загружает faiss индекс с диска. Опционально переносит на GPU.
     """
     if not os.path.exists(index_path):
         raise FileNotFoundError(index_path)
     index = faiss.read_index(index_path)
-    if use_gpu:
+    if config.model.use_cpu:
         try:
             if faiss.get_num_gpus() > 0:
                 res = faiss.StandardGpuResources()
-                index = faiss.index_cpu_to_gpu(res, gpu_id, index)
+                index = faiss.index_cpu_to_gpu(res, config.model.gpu_id, index)
         except Exception as e:
             LOGGER.info(f"  - Предупреждение: не удалось перенести индекс на GPU: {e}")
     return index

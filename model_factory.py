@@ -1,5 +1,5 @@
 import os
-from cli import ARG_LOG_LEVEL, DEVICE, LOGGER
+from cli import DEVICE, LOGGER
 from models import MODEL_CONFIGS
 import torch
 from PIL import Image

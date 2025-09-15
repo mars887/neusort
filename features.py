@@ -9,12 +9,13 @@ from torchvision.transforms import InterpolationMode
 
 from PIL import Image
 
-from cli import ARG_MODEL_NAME, DEVICE
+from cli import DEVICE
+from config import Config
 from models import MODEL_CONFIGS
 Image.MAX_IMAGE_PIXELS = None  # Снимает ограничение на размер изображений
 
 
-def extract_feature(path, model, hook_blob, more_scan=False):
+def extract_feature(path, model, hook_blob, config: Config):
     """
     Извлекает вектор признаков из одного изображения.
     Поддерживает стандартный и избыточный (more_scan) режимы.
@@ -25,23 +26,23 @@ def extract_feature(path, model, hook_blob, more_scan=False):
     img = Image.open(path).convert("RGB")
 
     # --- выбор размера / препроцессинга в зависимости от модели ---
-    is_clip = ARG_MODEL_NAME.startswith("clip_")
+    is_clip = config.model.model_name.startswith("clip_")
     if is_clip:
         # Рекомендуемый размер для clip_vitl14@336 — 336; можно поменять в MODEL_CONFIGS
-        pix_dim = MODEL_CONFIGS.get(ARG_MODEL_NAME, {}).get("input_size", 336)
+        pix_dim = MODEL_CONFIGS.get(config.model.model_name, {}).get("input_size", 336)
         from models import CLIP_PROCESSOR
         clip_processor = CLIP_PROCESSOR
     else:
-        if ARG_MODEL_NAME in ("convnext_small", "mobilenet_v3_small", "mobilenet_v3_large"):
+        if config.model.model_name in ("convnext_small", "mobilenet_v3_small", "mobilenet_v3_large"):
             pix_dim = 224
-        elif ARG_MODEL_NAME in ("regnet_y_400mf", "regnet_y_800mf", "regnet_y_1_6gf", "regnet_y_3_2gf", "regnet_y_8gf"):
-            pix_dim = MODEL_CONFIGS.get(ARG_MODEL_NAME, {}).get("input_size", 232)
-        elif ARG_MODEL_NAME in ("regnet_y_16gf", "regnet_y_32gf", "regnet_y_128gf"):
-            pix_dim = MODEL_CONFIGS.get(ARG_MODEL_NAME, {}).get("input_size", 384)
-        elif ARG_MODEL_NAME in ("efficientnet_v2_m","efficientnet_v2_l","efficientnet_v2_s"):
-            pix_dim = MODEL_CONFIGS.get(ARG_MODEL_NAME, {}).get("input_size", 480)
+        elif config.model.model_name in ("regnet_y_400mf", "regnet_y_800mf", "regnet_y_1_6gf", "regnet_y_3_2gf", "regnet_y_8gf"):
+            pix_dim = MODEL_CONFIGS.get(config.model.model_name, {}).get("input_size", 232)
+        elif config.model.model_name in ("regnet_y_16gf", "regnet_y_32gf", "regnet_y_128gf"):
+            pix_dim = MODEL_CONFIGS.get(config.model.model_name, {}).get("input_size", 384)
+        elif config.model.model_name in ("efficientnet_v2_m","efficientnet_v2_l","efficientnet_v2_s"):
+            pix_dim = MODEL_CONFIGS.get(config.model.model_name, {}).get("input_size", 480)
         else:
-            raise ValueError(f"Неизвестная модель: {ARG_MODEL_NAME}")
+            raise ValueError(f"Неизвестная модель: {config.model.model_name}")
 
     # --- вспомогательная функция: взять feat после forward (hook_blob должен быть заполнен) ---
     def fetch_feat_from_hook():
@@ -56,7 +57,7 @@ def extract_feature(path, model, hook_blob, more_scan=False):
         return arr
 
     # --- single crop режим ---
-    if not more_scan:
+    if not config.model.more_scan:
         if is_clip:
             # Используем CLIPProcessor если доступен — он сделает корректную нормализацию и ресайз
             if clip_processor is not None:

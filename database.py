@@ -8,9 +8,10 @@ import sqlite3
 
 import numpy as np
 import torch
-import tqdm
+from tqdm.auto import tqdm
 from cli import ARG_IMAGE_BATCH_SIZE, ARG_LOG_LEVEL,ARG_MODEL_NAME
 from features import extract_feature
+from cli import LOGGER
 from models import load_model
 
 
@@ -30,10 +31,10 @@ def process_and_cache_features(db_file, src_folder, more_scan, batch_size=ARG_IM
         more_scan (bool): Флаг использования избыточного сканирования.
         batch_size (int): Количество файлов для обработки перед сохранением в БД.
     """
-    if ARG_LOG_LEVEL == "default": print(f"Проверка и обновление кэша признаков в файле: {db_file}")
+    LOGGER.info(f"Проверка и обновление кэша признаков в файле: {db_file}")
     conn = create_connection(db_file)
     if conn is None:
-        if ARG_LOG_LEVEL == "default" or ARG_LOG_LEVEL == "error": print(" ! Не удалось создать соединение с базой данных.")
+        LOGGER.error(" ! Не удалось создать соединение с базой данных.")
         return
 
     try:
@@ -47,7 +48,7 @@ def process_and_cache_features(db_file, src_folder, more_scan, batch_size=ARG_IM
         existing_paths_in_db = {row[0] for row in cursor.fetchall()}
         num_existing = len(existing_paths_in_db)
         if num_existing > 0:
-            if ARG_LOG_LEVEL == "default": print(f"База данных найдена. В ней уже есть {num_existing} записей.")
+            LOGGER.info(f"База данных найдена. В ней уже есть {num_existing} записей.")
         # 2. Получаем актуальный список файлов на диске
         supported_exts = (".jpg", ".jpeg", ".png", ".bmp", ".webp", ".jfif")
         current_paths_on_disk = {
@@ -59,12 +60,12 @@ def process_and_cache_features(db_file, src_folder, more_scan, batch_size=ARG_IM
         paths_to_process = sorted(list(current_paths_on_disk - existing_paths_in_db))
 
         if not paths_to_process:
-            if ARG_LOG_LEVEL == "default": print("База данных актуальна. Новых файлов для обработки не найдено.")
+            LOGGER.info("База данных актуальна. Новых файлов для обработки не найдено.")
             return
         
         model, hook = load_model(ARG_MODEL_NAME)
 
-        if ARG_LOG_LEVEL == "default": print(f"Найдено {len(paths_to_process)} новых изображений для обработки.")
+        LOGGER.info(f"Найдено {len(paths_to_process)} новых изображений для обработки.")
         
         # 4. Обрабатываем новые файлы пакетами
         for i in range(0, len(paths_to_process), batch_size):
@@ -82,7 +83,7 @@ def process_and_cache_features(db_file, src_folder, more_scan, batch_size=ARG_IM
                         feature_blob = sqlite3.Binary(feat.tobytes())
                         batch_feats_data.append((safe_path, feature_blob))
                 except Exception as e:
-                    if ARG_LOG_LEVEL == "default" or ARG_LOG_LEVEL == "error": print(f" ! Ошибка при обработке файла {full_path}: {e}")
+                    LOGGER.error(f" ! Ошибка при обработке файла {full_path}: {e}")
 
             # 5. Сохраняем пакет в базу данных
             if batch_feats_data:
@@ -91,9 +92,9 @@ def process_and_cache_features(db_file, src_folder, more_scan, batch_size=ARG_IM
                         INSERT OR IGNORE INTO features (filename, features) VALUES (?, ?)
                     ''', batch_feats_data)
                     conn.commit()
-                    if ARG_LOG_LEVEL == "default": print(f"Успешно сохранено {len(batch_feats_data)} новых признаков в БД.")
+                    LOGGER.info(f"Успешно сохранено {len(batch_feats_data)} новых признаков в БД.")
                 except Exception as e:
-                    if ARG_LOG_LEVEL == "default" or ARG_LOG_LEVEL == "error": print(f" ! Ошибка при сохранении пакета в базу данных: {e}")
+                    LOGGER.error(f" ! Ошибка при сохранении пакета в базу данных: {e}")
                     conn.rollback()
 
         del model
@@ -112,7 +113,7 @@ def create_connection(db_file):
         conn = sqlite3.connect(db_file)
         return conn
     except sqlite3.Error as e:
-        print(e)
+        LOGGER.error(e)
     return conn
 
 def create_table(conn):
@@ -127,7 +128,7 @@ def create_table(conn):
             )
         ''')
     except sqlite3.Error as e:
-        print(e)
+        LOGGER.error(e)
 
 
 
@@ -166,7 +167,7 @@ def load_features_from_db(db_file):
     feats_list = []
     deleted_count = 0
 
-    if ARG_LOG_LEVEL == "default": print("Проверка актуальности записей в базе данных...")
+    LOGGER.info("Проверка актуальности записей в базе данных...")
     for filename, features_blob in rows:
         # Проверяем, что файл, указанный в базе, все еще существует
         if os.path.exists(filename):
@@ -177,7 +178,7 @@ def load_features_from_db(db_file):
             deleted_count += 1
 
     if deleted_count > 0:
-        if ARG_LOG_LEVEL == "default": print(f"Пропущено {deleted_count} записей для удаленных файлов.")
+        LOGGER.info(f"Пропущено {deleted_count} записей для удаленных файлов.")
 
     # Если после фильтрации ничего не осталось (например, удалили все картинки)
     if not paths:

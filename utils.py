@@ -2,8 +2,9 @@ import os
 import shutil
 
 import numpy as np
-import tqdm
+from tqdm.auto import tqdm
 from cli import ARG_LOG_LEVEL
+from cli import LOGGER
 
 
 def copy_and_rename(paths, order, out_folder):
@@ -28,7 +29,7 @@ def copy_and_rename(paths, order, out_folder):
             pbar.update(1)
         pbar.close()
 
-    if ARG_LOG_LEVEL == "default": print(f"Копирование завершено.")
+    LOGGER.info(f"Копирование завершено.")
 
 def output_sequence_with_neighbors(paths, feats, order, neighbors=3, out_file=None):
     """
@@ -45,7 +46,7 @@ def output_sequence_with_neighbors(paths, feats, order, neighbors=3, out_file=No
 
     n = len(order)
     if n == 0:
-        if ARG_LOG_LEVEL == "default": print("Нет элементов для вывода.")
+        LOGGER.info("Нет элементов для вывода.")
         return
 
     # Ordered arrays according to the final path
@@ -84,8 +85,8 @@ def output_sequence_with_neighbors(paths, feats, order, neighbors=3, out_file=No
         # Сохраняем в файл с utf-8
         with open(out_file, "w", encoding="utf-8") as f:
             f.write(output_text)
-        if ARG_LOG_LEVEL == "default": print(f"Saved neighbor list to: {out_file}")
+        LOGGER.info(f"Saved neighbor list to: {out_file}")
     else:
-        if ARG_LOG_LEVEL == "default": print(output_text)
+        LOGGER.info(output_text)
 
 

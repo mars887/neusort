@@ -3,6 +3,7 @@
 # ---------------------------------------------------------------------------- #
 import argparse
 import torch
+from logger import CustomLogger, LogLevel
 
 
 parser = argparse.ArgumentParser(
@@ -151,17 +152,18 @@ parser.add_argument(
     "--loglevel",
     type=str,
     default='default',
-    choices=["default","error","quiet"],
+    choices=["default","error","quiet","debug"],
     help="Log level",
 )
-
-
 
 
 # ------------------------------------------------------
 
 
 args = parser.parse_args()
+
+LOGGER = CustomLogger(level = LogLevel(args.loglevel))
+
 ARG_MODEL_NAME = args.m
 ARG_MORE_SCAN = args.more_scan
 ARG_SRC_FOLDER = args.i
@@ -185,7 +187,7 @@ ARG_TSV_NEIGHBORS = args.tsv_neighbors
 # --- Конфигурации нейросетей ---
 if ARG_USE_CPU:
     DEVICE = torch.device("cpu")
-    if ARG_LOG_LEVEL == "default": print("задано использование только процессора")
+    LOGGER.info("задано использование только процессора")
 else:
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 

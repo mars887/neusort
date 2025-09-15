@@ -14,6 +14,8 @@ from models import load_model
 from search import find_and_print_neighbors_simple, find_and_print_neighbors_simple_extended, print_neighbors_indexed
 from sorting import sort_images
 
+from cli import LOGGER
+
 # ---------------------------------------------------------------------------- #
 #                                    Main                                      #
 # ---------------------------------------------------------------------------- #
@@ -25,7 +27,7 @@ if __name__ == "__main__":
 
     # Убедимся, что папка с исходниками есть
     if not os.path.isdir(ARG_SRC_FOLDER):
-        if ARG_LOG_LEVEL == "default" or ARG_LOG_LEVEL == "error": print(f"Создайте папку {ARG_SRC_FOLDER} и положите туда картинки.")
+        LOGGER.error(f"Создайте папку {ARG_SRC_FOLDER} и положите туда картинки.")
         os.makedirs(ARG_SRC_FOLDER, exist_ok=True)
         exit(1)
 
@@ -33,9 +35,8 @@ if __name__ == "__main__":
     # Эта функция сама найдет новые файлы и обработает только их
     process_and_cache_features(DB_FILE, ARG_SRC_FOLDER, more_scan=ARG_MORE_SCAN)
 
-
     # 3. Загружаем ВСЕ актуальные признаки из базы для сортировки
-    if ARG_LOG_LEVEL == "default": print("Загружаем все признаки из базы данных для начала сортировки...")
+    LOGGER.info("Загружаем все признаки из базы данных для начала сортировки...")
     feats, paths = load_features_from_db(DB_FILE)
 
     if paths and feats is not None and len(paths) > 0:
@@ -49,7 +50,7 @@ if __name__ == "__main__":
 
             # Загружаем индекс и mapping
             if not os.path.exists(ARG_INDEX_FILE):
-                if ARG_LOG_LEVEL == "default" or ARG_LOG_LEVEL == "error": print(f"! Индекс не найден: {ARG_INDEX_FILE}. Сначала запустите без --find, чтобы его построить.")
+                LOGGER.error(f"! Индекс не найден: {ARG_INDEX_FILE}. Сначала запустите без --find, чтобы его построить.")
                 exit(2)
 
             index = load_faiss_index(ARG_INDEX_FILE, use_gpu=use_gpu_faiss)
@@ -252,8 +253,7 @@ if __name__ == "__main__":
                 print(f"! Не удалось загрузить модель для pipeline: {e}")
                 exit(11)
 
-            if ARG_LOG_LEVEL == "default": 
-                print("Pipeline mode started. Enter image paths (Ctrl+D/Ctrl+C to stop):", file=sys.stderr)
+            LOGGER.info("Pipeline mode started. Enter image paths (Ctrl+D/Ctrl+C to stop):", file=sys.stderr)
 
             # Основной цикл: читаем пути из stdin
             for raw in sys.stdin:
@@ -270,10 +270,10 @@ if __name__ == "__main__":
                     try:
                         qfeat = extract_feature(qpath, model, hook, more_scan=ARG_MORE_SCAN)
                         if qfeat is None:
-                            print(f"{qpath}\t-1\tERROR_EXTRACT")
+                            LOGGER.error(f"{qpath}\t-1\tERROR_EXTRACT")
                             continue
                     except Exception as e:
-                        print(f"{qpath}\t-1\tERROR_EXTRACT:{e}")
+                        LOGGER.error(f"{qpath}\t-1\tERROR_EXTRACT:{e}")
                         continue
 
                     q = qfeat.astype('float32').reshape(1, -1)
@@ -285,17 +285,17 @@ if __name__ == "__main__":
                         Dq, Iq = index.search(q, kk)
                         Dq = np.sqrt(Dq)
                     except Exception as e:
-                        print(f"{qpath}\t-1\tERROR_FAISS:{e}")
+                        LOGGER.error(f"{qpath}\t-1\tERROR_FAISS:{e}")
                         continue
 
                     if Iq.size == 0:
-                        print(f"{qpath}\t-1\tNO_RESULTS")
+                        LOGGER.error(f"{qpath}\t-1\tNO_RESULTS")
                         continue
 
                     # ближайшая позиция в faiss
                     nearest_pos = int(Iq[0, 0])
                     if nearest_pos < 0 or nearest_pos >= len(faiss_pos_to_path):
-                        print(f"{qpath}\t-1\tNO_VALID_NEIGHBORS")
+                        LOGGER.error(f"{qpath}\t-1\tNO_VALID_NEIGHBORS")
                         continue
                     nearest_path = faiss_pos_to_path[nearest_pos]
                     nearest_orig_idx = int(order_map[nearest_pos])
@@ -304,7 +304,7 @@ if __name__ == "__main__":
                     ctx_orig_idx, ctx_pos, ctx_neighbors = find_neighbors_for_path(nearest_path)
                     if ctx_orig_idx is None or ctx_orig_idx in ("AMBIGUOUS", "NOT_IN_INDEX"):
                         # Если по какой-то причине не нашли (маловероятно) — печатаем простую информацию
-                        print(f"{nearest_path}\t{nearest_pos}\tCTX_NOT_FOUND")
+                        LOGGER.error(f"{nearest_path}\t{nearest_pos}\tCTX_NOT_FOUND")
                     else:
                         print_neighbors_indexed(paths, ctx_orig_idx, ctx_pos, ctx_neighbors)
 
@@ -331,13 +331,13 @@ if __name__ == "__main__":
                         extract_feature_fn=extract_feature,      # можно передать, но не используется, т.к. qvec передан
                         load_model_fn=load_model,                # тоже не нужен в этом вызове
                         model_name=ARG_MODEL_NAME,
-                        more_scan=ARG_MORE_SCAN
+                        more_scan=ARG_MORE_SCAN,
                     )
 
                 elif orig_idx == "AMBIGUOUS":
-                    print(f"{qpath}\t-1\tAMBIGUOUS")
+                    LOGGER.error(f"{qpath}\t-1\tAMBIGUOUS")
                 elif orig_idx == "NOT_IN_INDEX":
-                    print(f"{qpath}\t-1\tNOT_INDEXED")
+                    LOGGER.error(f"{qpath}\t-1\tNOT_INDEXED")
                 else:
                     # найден в БД — печатаем оба варианта (как вы просили)
                     print_neighbors_indexed(paths, orig_idx, pos, neighbors)
@@ -359,16 +359,16 @@ if __name__ == "__main__":
         else:
             # стройка простого IndexFlatL2 и сохранение
             d = feats.shape[1]
-            if ARG_LOG_LEVEL == "default": print(f"Построение FAISS индекса (IndexFlatL2) по {len(paths)} вектор(ов) размерности {d} ...")
+            LOGGER.info(f"Построение FAISS индекса (IndexFlatL2) по {len(paths)} вектор(ов) размерности {d} ...")
             index = faiss.IndexFlatL2(d)
             if use_gpu_faiss:
                 try:
                     res = faiss.StandardGpuResources()
                     index = faiss.index_cpu_to_gpu(res, 0, index)
                 except Exception as e:
-                    if ARG_LOG_LEVEL == "default": print(f"  - Предупреждение: не удалось перенести индекс на GPU: {e}")
+                    LOGGER.info(f"  - Предупреждение: не удалось перенести индекс на GPU: {e}")
             index.add(feats.astype('float32', copy=False))
 
             # дальше — стандартная сортировка/поведение скрипта
-            if ARG_LOG_LEVEL == "default": print(f"Всего в работе {len(paths)} изображений. Начинаем сортировку...")
+            LOGGER.info(f"Всего в работе {len(paths)} изображений. Начинаем сортировку...")
             sort_images(feats, paths, ARG_DST_FOLDER)

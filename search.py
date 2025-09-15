@@ -2,10 +2,11 @@ import os
 import faiss
 import numpy as np
 import torch
-import tqdm
+from tqdm.auto import tqdm
 
 from cli import ARG_BATCH_SIZE, ARG_LOG_LEVEL
 from faiss_io import load_faiss_index
+from cli import LOGGER
 from models import load_model
 
 
@@ -27,7 +28,7 @@ def compute_global_knn(feats: np.ndarray, k: int, batch_size: int = ARG_BATCH_SI
             res = faiss.StandardGpuResources()
             index = faiss.index_cpu_to_gpu(res, 0, index)
         except Exception as e:
-            if ARG_LOG_LEVEL == "default": print(f"  - Предупреждение: не удалось перенести FAISS на GPU: {e}. Будет использован CPU.")
+            LOGGER.info(f"  - Предупреждение: не удалось перенести FAISS на GPU: {e}. Будет использован CPU.")
     index.add(feats_f32)
 
     knn_k = min(k + 1, n)  # ищем k+1 чтобы исключить саму точку
@@ -64,14 +65,14 @@ def find_and_print_neighbors_simple(index_file, feats, paths, target_path, k=5, 
     """
     # Проверки
     if not os.path.exists(index_file):
-        if ARG_LOG_LEVEL == "default" or ARG_LOG_LEVEL == "error": print(f"! FAISS index file not found: {index_file}. Постройте индекс без --find.")
+        LOGGER.error(f"! FAISS index file not found: {index_file}. Постройте индекс без --find.")
         return 2
 
     # Загрузим индекс (функция load_faiss_index предполагается в вашем скрипте)
     try:
         index = load_faiss_index(index_file, use_gpu=use_gpu)
     except Exception as e:
-        if ARG_LOG_LEVEL == "default" or ARG_LOG_LEVEL == "error": print(f"! Error loading FAISS index: {e}")
+        LOGGER.error(f"! Error loading FAISS index: {e}")
         return 3
 
     # Попытаемся загрузить mapping faiss_pos -> original_idx
@@ -102,9 +103,8 @@ def find_and_print_neighbors_simple(index_file, feats, paths, target_path, k=5, 
     # Проверка согласованности
     ntotal = index.ntotal
     if faiss_pos_to_path is None or len(faiss_pos_to_path) < ntotal:
-        if ARG_LOG_LEVEL == "default" or ARG_LOG_LEVEL == "error":
-            print("! Нельзя сопоставить позиции FAISS с путями к файлам (order.npy / paths.txt отсутствуют или корявы).")
-            print("  Пожалуйста, перестройте индекс и сохраните mapping (see --list_only behaviour).")
+        LOGGER.error("! Нельзя сопоставить позиции FAISS с путями к файлам (order.npy / paths.txt отсутствуют или корявы).")
+        LOGGER.error("  Пожалуйста, перестройте индекс и сохраните mapping (see --list_only behaviour).")
         return 4
 
     # Найдём оригинальный индекс (в списке paths) для target_path
@@ -121,14 +121,13 @@ def find_and_print_neighbors_simple(index_file, feats, paths, target_path, k=5, 
         if len(matches) == 1:
             target_orig_idx = matches[0]
         elif len(matches) > 1:
-            if ARG_LOG_LEVEL == "default": 
-                print(f"! Найдено несколько файлов с basename {base}. Укажите полный путь.")
-                # выведем первые 20 совпадений для помощи
-                for i in matches[:20]:
-                    print(f"  - {i}\t{paths[i]}")
+            LOGGER.error(f"! Найдено несколько файлов с basename {base}. Укажите полный путь.")
+            # выведем первые 20 совпадений для помощи
+            for i in matches[:20]:
+                LOGGER.error(f"  - {i}\t{paths[i]}")
             return 5
         else:
-            if ARG_LOG_LEVEL == "default" or ARG_LOG_LEVEL == "error": print(f"! Файл '{target_path}' не найден в кэше/БД.")
+            LOGGER.error(f"! Файл '{target_path}' не найден в кэше/БД.")
             return 6
 
     # Найдём position в FAISS (если order_map сохранён)
@@ -150,7 +149,7 @@ def find_and_print_neighbors_simple(index_file, feats, paths, target_path, k=5, 
             pos_in_faiss = None
 
     if pos_in_faiss is None:
-        if ARG_LOG_LEVEL == "default" or ARG_LOG_LEVEL == "error": print("! Не удалось найти позицию файла в сохранённом mapping. Перестройте индекс (без --find).")
+        LOGGER.error("! Не удалось найти позицию файла в сохранённом mapping. Перестройте индекс (без --find).")
         return 7
 
     # готовим запрос
@@ -200,27 +199,23 @@ def find_neighbors_for_external_image(index, index_file, query_path, extract_fea
     - k: количество соседей
     """
     if not os.path.exists(query_path):
-        if ARG_LOG_LEVEL == "default" or ARG_LOG_LEVEL == "error":
-            print(f"! Внешний файл не найден: {query_path}")
+        LOGGER.error(f"! Внешний файл не найден: {query_path}")
         return 10
 
     # Загружаем модель один раз
     try:
         model, hook = load_model(model_name)
     except Exception as e:
-        if ARG_LOG_LEVEL == "default" or ARG_LOG_LEVEL == "error":
-            print(f"! Не удалось загрузить модель для извлечения признаков: {e}")
+        LOGGER.error(f"! Не удалось загрузить модель для извлечения признаков: {e}")
         return 11
 
     try:
         qfeat = extract_feature_fn(query_path, model, hook, more_scan=more_scan_flag)
         if qfeat is None:
-            if ARG_LOG_LEVEL == "default" or ARG_LOG_LEVEL == "error":
-                print(f"! Не удалось извлечь признаки для {query_path}")
+            LOGGER.error(f"! Не удалось извлечь признаки для {query_path}")
             return 12
     except Exception as e:
-        if ARG_LOG_LEVEL == "default" or ARG_LOG_LEVEL == "error":
-            print(f"! Ошибка при извлечении признаков для {query_path}: {e}")
+        LOGGER.error(f"! Ошибка при извлечении признаков для {query_path}: {e}")
         return 13
     finally:
         # можем удалить модель из памяти
@@ -240,8 +235,7 @@ def find_neighbors_for_external_image(index, index_file, query_path, extract_fea
         with np.errstate(invalid='ignore'):
             D = np.sqrt(D)
     except Exception as e:
-        if ARG_LOG_LEVEL == "default" or ARG_LOG_LEVEL == "error":
-            print(f"! Ошибка при поиске в FAISS: {e}")
+        LOGGER.error(f"! Ошибка при поиске в FAISS: {e}")
         return 14
 
     # Формируем список соседей pos:dist и пути
@@ -260,10 +254,8 @@ def find_neighbors_for_external_image(index, index_file, query_path, extract_fea
     out_line = f"{query_path}\t-1\t{','.join(neighbor_entries)}"
     # Печатаем краткую строку (по вашему формату)
     print(out_line)
-    # При желании печатаем также пути соседей (разделённые)
-    if ARG_LOG_LEVEL == "default":
-        for p, e in zip(neighbor_paths, neighbor_entries):
-            print(f"  -> {p}\t{e.split(':')[1]}")
+    for p, e in zip(neighbor_paths, neighbor_entries):
+        print(f"  -> {p}\t{e.split(':')[1]}")
     return 0
 
 
@@ -315,19 +307,19 @@ def find_and_print_neighbors_simple_extended(
             # внешний: попытаемся использовать переданную модель, иначе загрузим свою
             if model is None or hook is None:
                 if load_model_fn is None:
-                    print(f"{query_path}\t-1\tERROR_NO_MODEL_FUNC")
+                    LOGGER.error(f"{query_path}\t-1\tERROR_NO_MODEL_FUNC")
                     return
                 try:
                     model, hook = load_model_fn(model_name)
                     model_loaded_here = True
                 except Exception as e:
-                    print(f"{query_path}\t-1\tERROR_LOAD_MODEL:{e}")
+                    LOGGER.error(f"{query_path}\t-1\tERROR_LOAD_MODEL:{e}")
                     return
             # извлекаем признаки
             try:
                 qfeat = extract_feature_fn(query_path, model, hook, more_scan=more_scan)
                 if qfeat is None:
-                    print(f"{query_path}\t-1\tERROR_EXTRACT")
+                    LOGGER.error(f"{query_path}\t-1\tERROR_EXTRACT")
                     # если модель была загружена здесь — освободим
                     if model_loaded_here:
                         try:
@@ -337,7 +329,7 @@ def find_and_print_neighbors_simple_extended(
                     return
                 qvec = qfeat.astype('float32').reshape(1, -1)
             except Exception as e:
-                print(f"{query_path}\t-1\tERROR_EXTRACT:{e}")
+                LOGGER.error(f"{query_path}\t-1\tERROR_EXTRACT:{e}")
                 if model_loaded_here:
                     try:
                         del model
@@ -351,7 +343,7 @@ def find_and_print_neighbors_simple_extended(
     try:
         D, I = index.search(qvec, kk)
     except Exception as e:
-        print(f"{query_path}\t-1\tERROR_FAISS:{e}")
+        LOGGER.error(f"{query_path}\t-1\tERROR_FAISS:{e}")
         if model_loaded_here:
             try:
                 del model

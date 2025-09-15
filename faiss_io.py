@@ -2,7 +2,7 @@
 import os
 import faiss
 
-from cli import ARG_LOG_LEVEL
+from cli import ARG_LOG_LEVEL, LOGGER
 
 
 def save_faiss_index(index, index_path):
@@ -24,7 +24,7 @@ def save_faiss_index(index, index_path):
         faiss.write_index(index_cpu, tmp_path)
         os.replace(tmp_path, index_path)
     except Exception as e:
-        if ARG_LOG_LEVEL == "default" or ARG_LOG_LEVEL == "error": print(f"! Не удалось сохранить FAISS индекс: {e}")
+        LOGGER.error(f"! Не удалось сохранить FAISS индекс: {e}")
         if os.path.exists(tmp_path):
             try: os.remove(tmp_path)
             except: pass
@@ -42,6 +42,6 @@ def load_faiss_index(index_path, use_gpu=False, gpu_id=0):
                 res = faiss.StandardGpuResources()
                 index = faiss.index_cpu_to_gpu(res, gpu_id, index)
         except Exception as e:
-            if ARG_LOG_LEVEL == "default": print(f"  - Предупреждение: не удалось перенести индекс на GPU: {e}")
+            LOGGER.info(f"  - Предупреждение: не удалось перенести индекс на GPU: {e}")
     return index
 

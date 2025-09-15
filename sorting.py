@@ -6,7 +6,7 @@ from collections import defaultdict
 import time
 import numpy as np
 import torch
-import tqdm
+from tqdm.auto import tqdm
 
 import faiss
 from scipy.sparse import csr_matrix, coo_matrix
@@ -14,6 +14,7 @@ from scipy.sparse.csgraph import minimum_spanning_tree, depth_first_order, conne
 
 from cli import ARG_BATCH_SIZE, ARG_INDEX_FILE, ARG_LIST_ONLY, ARG_LOG_LEVEL, ARG_LOOKAHEAD, ARG_NEIGHBORS_K_LIMIT, ARG_OUT_TSV, ARG_TSV_NEIGHBORS,ARG_TWO_OPT_BLOCK_SIZE,ARG_SORT_OPTIMIZER,ARG_TWO_OPT_SHIFT, ARG_USE_CPU
 from faiss_io import save_faiss_index
+from cli import LOGGER
 from search import compute_global_knn
 from utils import copy_and_rename
 
@@ -120,29 +121,29 @@ def sort_by_ann_mst(feats: np.ndarray, k: int, batch_size: int = ARG_BATCH_SIZE,
     
     
     if faiss is None:
-        if ARG_LOG_LEVEL == "default" or ARG_LOG_LEVEL == "error": print("! ОШИБКА: Библиотека 'faiss' не установлена. Сортировка невозможна.")
+        LOGGER.error("! ОШИБКА: Библиотека 'faiss' не установлена. Сортировка невозможна.")
         return None
 
     n, d = feats.shape
     total_start_time = time.time()
 
-    if ARG_LOG_LEVEL == "default":
-        print("\n" + "="*80)
-        print(f"Запуск улучшенной сортировки методом ANN + MST (на основе Евклидова расстояния)") # Изменено для ясности
-        print(f"  - Изображений: {n}")
-        print(f"  - Размерность фичей: {d}")
-        print(f"  - Соседей на точку (k): {k}")
-        print(f"  - Размер батча: {batch_size}")
-        print(f"  - Использовать GPU: {use_gpu}")
-        print(f"  - Оптимизатор: {optimizer} (block_size={block_size}, shift={shift})")
-        print("="*80)
+
+    LOGGER.info("\n" + "="*80)
+    LOGGER.info(f"Запуск улучшенной сортировки методом ANN + MST (на основе Евклидова расстояния)") # Изменено для ясности
+    LOGGER.info(f"  - Изображений: {n}")
+    LOGGER.info(f"  - Размерность фичей: {d}")
+    LOGGER.info(f"  - Соседей на точку (k): {k}")
+    LOGGER.info(f"  - Размер батча: {batch_size}")
+    LOGGER.info(f"  - Использовать GPU: {use_gpu}")
+    LOGGER.info(f"  - Оптимизатор: {optimizer} (block_size={block_size}, shift={shift})")
+    LOGGER.info("="*80)
 
     # Работаем с копией float32 для FAISS
     feats_copy = feats.astype('float32').copy()
 
     # --- Шаг 1: Индексация в FAISS ---
     step_start_time = time.time()
-    if ARG_LOG_LEVEL == "default": print(f"\n[1/5] Шаг 1: Индексация векторов в FAISS...")
+    LOGGER.info(f"\n[1/5] Шаг 1: Индексация векторов в FAISS...")
     try:
         # ИЗМЕНЕНИЕ 1: Убираем нормализацию. Она не нужна для евклидова расстояния.
         # faiss.normalize_L2(feats_copy)
@@ -151,21 +152,21 @@ def sort_by_ann_mst(feats: np.ndarray, k: int, batch_size: int = ARG_BATCH_SIZE,
         index = faiss.IndexFlatL2(d)
 
         if use_gpu and torch is not None and torch.cuda.is_available():
-            if ARG_LOG_LEVEL == "default": print("  - Попытка использовать GPU для FAISS...")
+            LOGGER.info("  - Попытка использовать GPU для FAISS...")
             res = faiss.StandardGpuResources()
             index = faiss.index_cpu_to_gpu(res, 0, index)
-            if ARG_LOG_LEVEL == "default": print("  - Индекс успешно перенесен на GPU.")
+            LOGGER.info("  - Индекс успешно перенесен на GPU.")
 
         index.add(feats_copy)
-        if ARG_LOG_LEVEL == "default": print(f"  - Индекс создан. Всего векторов: {index.ntotal}.")
-        if ARG_LOG_LEVEL == "default": print(f"  - Время на шаг 1: {time.time() - step_start_time:.2f} сек.")
+        LOGGER.info(f"  - Индекс создан. Всего векторов: {index.ntotal}.")
+        LOGGER.info(f"  - Время на шаг 1: {time.time() - step_start_time:.2f} сек.")
     except Exception as e:
-        if ARG_LOG_LEVEL == "default" or ARG_LOG_LEVEL == "error": print(f"! Ошибка на шаге 1: {e}")
+        LOGGER.error(f"! Ошибка на шаге 1: {e}")
         return None
 
     # --- Шаг 2: Поиск k-ближайших соседей ---
     step_start_time = time.time()
-    if ARG_LOG_LEVEL == "default": print(f"\n[2/5] Шаг 2: Поиск {k} ближайших соседей...")
+    LOGGER.info(f"\n[2/5] Шаг 2: Поиск {k} ближайших соседей...")
     try:
         all_distances = []
         all_indices = []
@@ -180,15 +181,15 @@ def sort_by_ann_mst(feats: np.ndarray, k: int, batch_size: int = ARG_BATCH_SIZE,
         # Переименуем для ясности.
         distances_sq = np.vstack(all_distances)
         indices = np.vstack(all_indices)
-        if ARG_LOG_LEVEL == "default": print(f"  - Поиск завершен. Размер матрицы индексов: {indices.shape}")
-        if ARG_LOG_LEVEL == "default": print(f"  - Время на шаг 2: {time.time() - step_start_time:.2f} сек.")
+        LOGGER.info(f"  - Поиск завершен. Размер матрицы индексов: {indices.shape}")
+        LOGGER.info(f"  - Время на шаг 2: {time.time() - step_start_time:.2f} сек.")
     except Exception as e:
-        if ARG_LOG_LEVEL == "default" or ARG_LOG_LEVEL == "error": print(f"! Ошибка на шаге 2: {e}")
+        LOGGER.error(f"! Ошибка на шаге 2: {e}")
         return None
 
     # --- Шаг 3: Построение симметричного разреженного графа ---
     step_start_time = time.time()
-    if ARG_LOG_LEVEL == "default": print(f"\n[3/5] Шаг 3: Построение симметричного графа...")
+    LOGGER.info(f"\n[3/5] Шаг 3: Построение симметричного графа...")
     try:
         # Индексы соседей (исключаем первый столбец, т.к. это сама точка)
         cols = indices[:, 1:].flatten()
@@ -208,10 +209,10 @@ def sort_by_ann_mst(feats: np.ndarray, k: int, batch_size: int = ARG_BATCH_SIZE,
         # Делаем граф симметричным, выбирая минимальную стоимость ребра
         symmetric_graph = asymmetric_graph.minimum(asymmetric_graph.T)
 
-        if ARG_LOG_LEVEL == "default": print(f"  - Граф успешно создан. Количество ребер: {symmetric_graph.nnz}.")
-        if ARG_LOG_LEVEL == "default": print(f"  - Время на шаг 3: {time.time() - step_start_time:.2f} сек.")
+        LOGGER.info(f"  - Граф успешно создан. Количество ребер: {symmetric_graph.nnz}.")
+        LOGGER.info(f"  - Время на шаг 3: {time.time() - step_start_time:.2f} сек.")
     except Exception as e:
-        if ARG_LOG_LEVEL == "default" or ARG_LOG_LEVEL == "error": print(f"! Ошибка на шаге 3: {e}")
+        LOGGER.error(f"! Ошибка на шаге 3: {e}")
         return None
 
     # --- Шаги 4 и 5 остаются без изменений, так как они работают с графом,
@@ -219,13 +220,13 @@ def sort_by_ann_mst(feats: np.ndarray, k: int, batch_size: int = ARG_BATCH_SIZE,
 
     # --- Шаг 4: Построение Minimum Spanning Tree (MST) ---
     step_start_time = time.time()
-    if ARG_LOG_LEVEL == "default": print(f"\n[4/5] Шаг 4: Построение Minimum Spanning Tree...")
+    LOGGER.info(f"\n[4/5] Шаг 4: Построение Minimum Spanning Tree...")
     try:
         mst = minimum_spanning_tree(symmetric_graph)
-        if ARG_LOG_LEVEL == "default": print(f"  - MST построено. Общая стоимость дерева: {mst.sum():.2f}.")
-        if ARG_LOG_LEVEL == "default": print(f"  - Время на шаг 4: {time.time() - step_start_time:.2f} сек.")
+        LOGGER.info(f"  - MST построено. Общая стоимость дерева: {mst.sum():.2f}.")
+        LOGGER.info(f"  - Время на шаг 4: {time.time() - step_start_time:.2f} сек.")
     except Exception as e:
-        if ARG_LOG_LEVEL == "default" or ARG_LOG_LEVEL == "error": print(f"! Ошибка на шаге 4: {e}")
+        LOGGER.error(f"! Ошибка на шаге 4: {e}")
         return None
 
     # --- Шаг 5
@@ -233,7 +234,7 @@ def sort_by_ann_mst(feats: np.ndarray, k: int, batch_size: int = ARG_BATCH_SIZE,
 
     # --- Начало исправленного блока для Шага 5 ---
     step_start_time = time.time()
-    if ARG_LOG_LEVEL == "default": print(f"\n[5/5] Шаг 5: Двухэтапная кластеризация и обход...")
+    LOGGER.info(f"\n[5/5] Шаг 5: Двухэтапная кластеризация и обход...")
     
     try:
         n = mst.shape[0]
@@ -241,7 +242,7 @@ def sort_by_ann_mst(feats: np.ndarray, k: int, batch_size: int = ARG_BATCH_SIZE,
         n_components, labels = connected_components(csgraph=mst, directed=False, return_labels=True)
         
         # --- ЭТАП 1: ОБРАБОТКА ОСНОВНОЙ КОМПОНЕНТЫ ---
-        if ARG_LOG_LEVEL == "default": print(f"\n  --- Этап 1: Обработка основной компоненты ---")
+        LOGGER.info(f"\n  --- Этап 1: Обработка основной компоненты ---")
         if n_components > 0:
             component_sizes = np.bincount(labels)
             main_component_id = np.argmax(component_sizes)
@@ -249,7 +250,7 @@ def sort_by_ann_mst(feats: np.ndarray, k: int, batch_size: int = ARG_BATCH_SIZE,
             main_nodes_indices = np.where(main_nodes_mask)[0]
             total_in_main_component = len(main_nodes_indices)
             
-            if ARG_LOG_LEVEL == "default": print(f"  - Найдена основная компонента размером {total_in_main_component} узлов.")
+            LOGGER.info(f"  - Найдена основная компонента размером {total_in_main_component} узлов.")
             
             start_node = main_nodes_indices[0]
             
@@ -257,21 +258,21 @@ def sort_by_ann_mst(feats: np.ndarray, k: int, batch_size: int = ARG_BATCH_SIZE,
             
             # --- ГЛАВНЫЙ ПЕРЕКЛЮЧАТЕЛЬ АЛГОРИТМОВ ---
             if LOOKAHEAD_DEPTH <= 1:
-                if ARG_LOG_LEVEL == "default": print(f"  - Глубина просмотра (depth={LOOKAHEAD_DEPTH}) <= 1. Используется стандартный быстрый DFS.")
+                LOGGER.info(f"  - Глубина просмотра (depth={LOOKAHEAD_DEPTH}) <= 1. Используется стандартный быстрый DFS.")
                 from scipy.sparse.csgraph import depth_first_order
                 # Запускаем простой DFS на всем MST, начиная с узла из главной компоненты.
                 # Он обойдет только свою компоненту связности.
                 main_path_indices, _ = depth_first_order(mst, i_start=start_node, directed=False)
                 main_path = main_path_indices[main_path_indices != -1] # Убираем непосещенные узлы
-                if ARG_LOG_LEVEL == "default": print(f"    - Стандартный DFS завершен.")
+                LOGGER.info(f"    - Стандартный DFS завершен.")
             else:
-                if ARG_LOG_LEVEL == "default": print(f"  - Глубина просмотра (depth={LOOKAHEAD_DEPTH}). Используется DFS с lookahead-оптимизацией.")
+                LOGGER.info(f"  - Глубина просмотра (depth={LOOKAHEAD_DEPTH}). Используется DFS с lookahead-оптимизацией.")
                 last_reported_percent = -1
                 def report_progress(processed_count, final_update=False):
                     nonlocal last_reported_percent
                     percent_done = int((processed_count / total_in_main_component) * 100)
                     if percent_done > last_reported_percent or final_update:
-                        if ARG_LOG_LEVEL == "default": print(f"    - Прогресс: {processed_count} / {total_in_main_component} узлов ({percent_done}%)", end='\r')
+                        LOGGER.info(f"    - Прогресс: {processed_count} / {total_in_main_component} узлов ({percent_done}%)", end='\r')
                         last_reported_percent = percent_done
                 
                 main_path, _ = optimized_depth_first_order(
@@ -280,18 +281,18 @@ def sort_by_ann_mst(feats: np.ndarray, k: int, batch_size: int = ARG_BATCH_SIZE,
                     lookahead_depth=LOOKAHEAD_DEPTH,
                     progress_callback=report_progress
                 )
-                if ARG_LOG_LEVEL == "default": print() # Перенос строки после прогресс-бара
+                LOGGER.info("") # Перенос строки после прогресс-бара
             
-            if ARG_LOG_LEVEL == "default": print(f"  - Основная компонента обработана. Длина основного пути: {len(main_path)}.")
+            LOGGER.info(f"  - Основная компонента обработана. Длина основного пути: {len(main_path)}.")
             
         else:
             # Редкий случай, если граф пуст
-            if ARG_LOG_LEVEL == "default": print("  - Не найдено ни одной компоненты. Основной путь пуст.")
+            LOGGER.info("  - Не найдено ни одной компоненты. Основной путь пуст.")
             main_path = np.array([], dtype=int)
             main_nodes_mask = np.zeros(n, dtype=bool)
     
         # --- ЭТАП 2: ОБРАБОТКА ОСТАВШИХСЯ "ОСТРОВОВ" ---
-        if ARG_LOG_LEVEL == "default": print(f"\n  --- Этап 2: Обработка оставшихся компонент ('островов') ---")
+        LOGGER.info(f"\n  --- Этап 2: Обработка оставшихся компонент ('островов') ---")
         
         island_nodes_indices = np.where(~main_nodes_mask)[0]
         num_islands = len(island_nodes_indices)
@@ -299,13 +300,13 @@ def sort_by_ann_mst(feats: np.ndarray, k: int, batch_size: int = ARG_BATCH_SIZE,
         secondary_path = np.array([], dtype=int) # Инициализируем вторичный путь
     
         if num_islands > 1:
-            if ARG_LOG_LEVEL == "default": print(f"  - Найдено {num_islands} узлов в 'островах'. Запускаем для них отдельный процесс ANN+MST+DFS.")
+            LOGGER.info(f"  - Найдено {num_islands} узлов в 'островах'. Запускаем для них отдельный процесс ANN+MST+DFS.")
             
             # Шаг 2.1: Извлекаем фичи только для "островов"
             island_feats = feats_copy[island_nodes_indices]
             
             # Шаг 2.2: ANN. Строим граф "все ко всем" (k = N-1)
-            if ARG_LOG_LEVEL == "default": print(f"    - [2.1/2.4] Поиск соседей для {num_islands}...")
+            LOGGER.info(f"    - [2.1/2.4] Поиск соседей для {num_islands}...")
             island_k = min(1000, num_islands - 1) # k не может быть больше N-1
             island_index = faiss.IndexFlatL2(island_feats.shape[1])
             if use_gpu: # Предполагается, что use_gpu определена ранее
@@ -315,7 +316,7 @@ def sort_by_ann_mst(feats: np.ndarray, k: int, batch_size: int = ARG_BATCH_SIZE,
             island_dists, island_neighbors_local_idx = island_index.search(island_feats, k=island_k)
             
             # Шаг 2.3: Построение графа и MST для "островов"
-            if ARG_LOG_LEVEL == "default": print(f"    - [2.2/2.4] Построение графа для 'островов'...")
+            LOGGER.info(f"    - [2.2/2.4] Построение графа для 'островов'...")
             
             # Индексы из FAISS - локальные (от 0 до num_islands-1).
             rows = np.arange(num_islands).repeat(island_k)
@@ -327,11 +328,11 @@ def sort_by_ann_mst(feats: np.ndarray, k: int, batch_size: int = ARG_BATCH_SIZE,
             island_graph = coo_matrix((data[valid_mask], (rows[valid_mask], cols[valid_mask])), shape=(num_islands, num_islands))
             island_graph.eliminate_zeros()
             
-            if ARG_LOG_LEVEL == "default": print(f"    - [2.3/2.4] Построение MST для 'островов'...")
+            LOGGER.info(f"    - [2.3/2.4] Построение MST для 'островов'...")
             island_mst = minimum_spanning_tree(island_graph)
             
             # Шаг 2.4: Простой DFS для MST "островов"
-            if ARG_LOG_LEVEL == "default": print(f"    - [2.4/2.4] Запуск простого DFS для 'островов'...")
+            LOGGER.info(f"    - [2.4/2.4] Запуск простого DFS для 'островов'...")
             from scipy.sparse.csgraph import depth_first_order
             
             # Начинаем с первого узла в локальном списке "островов"
@@ -340,36 +341,36 @@ def sort_by_ann_mst(feats: np.ndarray, k: int, batch_size: int = ARG_BATCH_SIZE,
             
             # Преобразуем локальные индексы пути (0..num_islands-1) в глобальные индексы изображений
             secondary_path = island_nodes_indices[island_path_local_visited]
-            if ARG_LOG_LEVEL == "default":  print(f"  - 'Острова' обработаны. Длина вторичного пути: {len(secondary_path)}.")
+            LOGGER.info(f"  - 'Острова' обработаны. Длина вторичного пути: {len(secondary_path)}.")
             
         elif num_islands == 1:
-            if ARG_LOG_LEVEL == "default": print("  - Найден 1 узел в 'островах', добавляем его напрямую.")
+            LOGGER.info("  - Найден 1 узел в 'островах', добавляем его напрямую.")
             secondary_path = island_nodes_indices
         else:
-            if ARG_LOG_LEVEL == "default": print("  - Нет 'островов' для обработки.")
+            LOGGER.info("  - Нет 'островов' для обработки.")
     
         # --- ЭТАП 3: ФИНАЛЬНАЯ СБОРКА И ПРОВЕРКА ---
-        if ARG_LOG_LEVEL == "default": print(f"\n  --- Этап 3: Финальная сборка пути ---")
+        LOGGER.info(f"\n  --- Этап 3: Финальная сборка пути ---")
         
         # Собираем основной путь и путь "островов"
         path_list = list(main_path) + list(secondary_path)
         
         # Проверяем, все ли узлы были посещены. Добавляем "потерянные" в конец.
         if len(path_list) != n:
-            if ARG_LOG_LEVEL == "default" or ARG_LOG_LEVEL == "error": print(f"  - ! ПРЕДУПРЕЖДЕНИЕ: Длина пути ({len(path_list)}) не равна общему числу элементов ({n}).")
+            LOGGER.error(f"  - ! ПРЕДУПРЕЖДЕНИЕ: Длина пути ({len(path_list)}) не равна общему числу элементов ({n}).")
             all_nodes = set(range(n))
             path_nodes = set(path_list)
             unvisited = list(all_nodes - path_nodes)
-            if ARG_LOG_LEVEL == "default": print(f"    - Найдено {len(unvisited)} непосещенных узлов. Добавляем их в конец.")
+            LOGGER.info(f"    - Найдено {len(unvisited)} непосещенных узлов. Добавляем их в конец.")
             path_list.extend(unvisited)
         
         path = np.array(path_list)
         
-        if ARG_LOG_LEVEL == "default": print(f"  - Сборка завершена. Получен полный путь из {len(path)} элементов.")
-        if ARG_LOG_LEVEL == "default": print(f"  - Время на шаг 5: {time.time() - step_start_time:.2f} сек.")
+        LOGGER.info(f"  - Сборка завершена. Получен полный путь из {len(path)} элементов.")
+        LOGGER.info(f"  - Время на шаг 5: {time.time() - step_start_time:.2f} сек.")
     
     except Exception as e:
-        if ARG_LOG_LEVEL == "default" or ARG_LOG_LEVEL == "error": print(f"\n! КРИТИЧЕСКАЯ ОШИБКА на шаге 5: {e}")
+        LOGGER.error(f"\n! КРИТИЧЕСКАЯ ОШИБКА на шаге 5: {e}")
         import traceback
         traceback.print_exc()
         path = None # Возвращаем None в случае ошибки
@@ -377,7 +378,7 @@ def sort_by_ann_mst(feats: np.ndarray, k: int, batch_size: int = ARG_BATCH_SIZE,
    
     # --- Шаг 6: Пост-обработка пути с оптимизатором ---
     step_start_time = time.time()
-    if ARG_LOG_LEVEL == "default": print(f"\n[6/6] Шаг 6: Пост-обработка пути с {optimizer} (блоки {block_size}, сдвиг {shift})...")
+    LOGGER.info(f"\n[6/6] Шаг 6: Пост-обработка пути с {optimizer} (блоки {block_size}, сдвиг {shift})...")
     
     # Вспомогательные функции для оптимизаторов
     def compute_distance_matrix(sub_feats):
@@ -426,36 +427,35 @@ def sort_by_ann_mst(feats: np.ndarray, k: int, batch_size: int = ARG_BATCH_SIZE,
         # В вашей логике концы всегда фиксированы, кроме, возможно, крайних блоков.
         # Для простоты здесь всегда считаем их фиксированными, т.к. они соединяются с остальной частью пути.
         # Если нужна особая логика для крайних блоков, ее можно добавить сюда.
-        fixed_ends = True
         
         if optimizer == '2opt':
-            optimized_path[start:end] = two_opt(subpath, sub_feats, fixed_ends=fixed_ends)
+            optimized_path[start:end] = two_opt(subpath, sub_feats)
 
     
     path = optimized_path
-    if ARG_LOG_LEVEL == "default": print(f"  - Пост-обработка завершена. Время: {time.time() - step_start_time:.2f} сек.")
+    LOGGER.info(f"  - Пост-обработка завершена. Время: {time.time() - step_start_time:.2f} сек.")
 
     
     # --- Финальный вывод (замените ваши оригинальные print'ы на это, чтобы учесть шаг 6) ---
-    if ARG_LOG_LEVEL == "default":
-        print("\n" + "="*80)
-        print("Сортировка методом ANN + MST успешно завершена.")
-        print(f"Общее время выполнения: {time.time() - total_start_time:.2f} сек.")
-        print("="*80 + "\n")
+    
+    LOGGER.info("\n" + "="*80)
+    LOGGER.info("Сортировка методом ANN + MST успешно завершена.")
+    LOGGER.info(f"Общее время выполнения: {time.time() - total_start_time:.2f} сек.")
+    LOGGER.info("="*80 + "\n")
     
     return path
 
 def sort_images(feats, paths, out_folder):
     n = feats.shape[0]
     if n < 1:
-        if ARG_LOG_LEVEL == "default": print("Нет изображений для сортировки.")
+        LOGGER.info("Нет изображений для сортировки.")
         return
 
-    if ARG_LOG_LEVEL == "default":
-        print(f"\n# {'-'*76} #")
-        print(f"# Сортировка изображений методом 'ANN+MST'") 
-        print(f"# {'-'*76} #")
-        print(f"Всего изображений: {n}")
+    
+    LOGGER.info(f"\n# {'-'*76} #")
+    LOGGER.info(f"# Сортировка изображений методом 'ANN+MST'") 
+    LOGGER.info(f"# {'-'*76} #")
+    LOGGER.info(f"Всего изображений: {n}")
 
     # Подбираем разумное k для внутреннего графа (как раньше)
     if len(paths) < ARG_NEIGHBORS_K_LIMIT:
@@ -467,7 +467,7 @@ def sort_images(feats, paths, out_folder):
     final_order = sort_by_ann_mst(feats, k=k_neighbors, use_gpu=use_gpu_faiss)
 
     if final_order is None or len(final_order) == 0:
-        if ARG_LOG_LEVEL == "default" or ARG_LOG_LEVEL == "error": print("! Сортировка не удалась, итоговый путь пуст. Операция отменена.")
+        LOGGER.error("! Сортировка не удалась, итоговый путь пуст. Операция отменена.")
         return
     
     # предположим: feats: np.ndarray shape (N,D), final_order: np.ndarray length N (original indices)
@@ -497,7 +497,7 @@ def sort_images(feats, paths, out_folder):
     if ARG_LIST_ONLY:
         # Вычисляем глобальные k-NN (по всей базе). Используем args.neighbors
         knn_k = max(1, ARG_TSV_NEIGHBORS)
-        if ARG_LOG_LEVEL == "default": print(f"\nВычисляем глобальные {knn_k} ближайших соседей и формируем файл...")
+        LOGGER.info(f"\nВычисляем глобальные {knn_k} ближайших соседей и формируем файл...")
 
         # Сначала постройте таблицу обратной индексации: original_index -> position in final order
         inverse_order = np.empty(len(final_order), dtype=int)
@@ -533,4 +533,4 @@ def sort_images(feats, paths, out_folder):
 
     # Если list_only не указан — поведение прежнее: копируем файлы в out_folder
     copy_and_rename(paths, final_order, out_folder)
-    if ARG_LOG_LEVEL == "default": print("Сортировка завершена.")
+    LOGGER.info("Сортировка завершена.")

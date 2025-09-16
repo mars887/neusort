@@ -29,10 +29,11 @@ def save_faiss_index(index, index_path,config: Config):
             try: os.remove(tmp_path)
             except: pass
 
-def load_faiss_index(index_path, config: Config):
+def load_faiss_index(config: Config):
     """
     Загружает faiss индекс с диска. Опционально переносит на GPU.
     """
+    index_path = config.files.index_file
     if not os.path.exists(index_path):
         raise FileNotFoundError(index_path)
     index = faiss.read_index(index_path)

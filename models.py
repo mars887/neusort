@@ -1,6 +1,3 @@
-CLIP_PROCESSOR = None
-
-
 MODEL_CONFIGS = {
     "mobilenet_v3_small": {"loader": lambda: __import__("torchvision.models", fromlist=["mobilenet_v3_small"]).mobilenet_v3_small, "weights": "IMAGENET1K_V1", "hook_target": ("classifier", 3), "feat_dim": 1280},
     "mobilenet_v3_large": {"loader": lambda: __import__("torchvision.models", fromlist=["mobilenet_v3_large"]).mobilenet_v3_large, "weights": "IMAGENET1K_V1", "hook_target": ("classifier", 3), "feat_dim": 1280},
@@ -111,7 +108,6 @@ MODEL_CONFIGS = {
 # ---------------------------------------------------------------------------- #
 from PIL import Image
 
-from cli import ARG_LOG_LEVEL, DEVICE
 from cli import LOGGER
 from model_factory import create_clip_openclip_model, create_clip_transformers_model, create_torchvision_model
         

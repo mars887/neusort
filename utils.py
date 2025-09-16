@@ -3,11 +3,11 @@ import shutil
 
 import numpy as np
 from tqdm.auto import tqdm
-from cli import ARG_LOG_LEVEL
-from cli import LOGGER
+from cli import CONFIG, LOGGER
+from config import Config
 
 
-def copy_and_rename(paths, order, out_folder):
+def copy_and_rename(paths, order, out_folder,config: Config):
     """Копирует и переименовывает файлы в соответствии с вычисленным порядком."""
     # Создаем папку, если она не существует. Если существует - ничего не делаем.
     os.makedirs(out_folder, exist_ok=True)
@@ -17,7 +17,7 @@ def copy_and_rename(paths, order, out_folder):
     num_digits = len(str(total_files - 1)) if total_files > 0 else 1 
     fmt = f"{{:0{num_digits}d}}"
 
-    if ARG_LOG_LEVEL == "default":
+    if config.misc.log_level == "default":
         pbar = tqdm(total=total_files, desc=f"Копирование в '{out_folder}'")
         for new_i, old_i in enumerate(order):
             src = paths[old_i]
@@ -90,3 +90,11 @@ def output_sequence_with_neighbors(paths, feats, order, neighbors, out_file=None
         LOGGER.info(output_text)
 
 
+def to_local_order(order_global: np.ndarray, component_nodes: np.ndarray, total_n: int) -> np.ndarray:
+    g2l = np.full(total_n, -1, dtype=np.int64)
+    g2l[component_nodes] = np.arange(len(component_nodes), dtype=np.int64)
+    order_local = g2l[order_global]
+    if (order_local < 0).any():
+        bad = order_global[order_local < 0][:10]
+        raise ValueError(f"Узлы вне компоненты: {bad.tolist()}")
+    return order_local

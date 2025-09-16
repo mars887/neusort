@@ -4,7 +4,7 @@ from models import MODEL_CONFIGS
 import torch
 from PIL import Image
 import torch.nn as nn
-
+from clip_manager import CLIP_PROCESSOR_MANAGER
 
 def find_final_linear_module(model):
     """
@@ -120,8 +120,9 @@ def create_clip_openclip_model(model_name, cfg):
         return {"pixel_values": batch}
     # -------------------------------------------------------------------------------
 
-    global CLIP_PROCESSOR
-    CLIP_PROCESSOR = oc_processor
+    CLIP_PROCESSOR_MANAGER.processor = oc_processor
+
+    LOGGER.info(f"proccessor set to {CLIP_PROCESSOR_MANAGER.processor}")
 
     # hook for collecting features
     def _hook(module, input, output):

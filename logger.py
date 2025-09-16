@@ -12,12 +12,12 @@ class CustomLogger:
 
     def info(self, message, end = None,file = None):
         if self.level in [LogLevel.DEBUG, LogLevel.DEFAULT]:
-            if end == "":
+            if end is None and file is None:
                 print(message)
-            elif file != None:
-                print(message,file)
+            elif file is not None:
+                print(message,file=file)
             else:
-                print(message,end)
+                print(message,end=end)
 
     def error(self, message):
         if self.level in [LogLevel.DEFAULT, LogLevel.ERROR, LogLevel.DEBUG]:

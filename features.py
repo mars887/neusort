@@ -9,10 +9,11 @@ from torchvision.transforms import InterpolationMode
 
 from PIL import Image
 
-from cli import DEVICE
+from cli import DEVICE, LOGGER
 from config import Config
 from models import MODEL_CONFIGS
 Image.MAX_IMAGE_PIXELS = None  # Снимает ограничение на размер изображений
+from clip_manager import CLIP_PROCESSOR_MANAGER
 
 
 def extract_feature(path, model, hook_blob, config: Config):
@@ -30,8 +31,9 @@ def extract_feature(path, model, hook_blob, config: Config):
     if is_clip:
         # Рекомендуемый размер для clip_vitl14@336 — 336; можно поменять в MODEL_CONFIGS
         pix_dim = MODEL_CONFIGS.get(config.model.model_name, {}).get("input_size", 336)
-        from models import CLIP_PROCESSOR
-        clip_processor = CLIP_PROCESSOR
+        clip_processor = CLIP_PROCESSOR_MANAGER.processor
+        if clip_processor is None:
+            LOGGER.error("CLIP_PROCESSOR не инициализирован, CLIP-модель не готова к использованию")
     else:
         if config.model.model_name in ("convnext_small", "mobilenet_v3_small", "mobilenet_v3_large"):
             pix_dim = 224

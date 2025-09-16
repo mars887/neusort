@@ -124,7 +124,19 @@ PROGRAMM_ARGS = {
         "default": 'default',
         "choices": ["default", "error", "quiet"],
         "help": "Уровень детализации логирования."
-    }
+    },
+    "--find_result_type": {
+        "type":str,
+        "default":'both',
+        "choices": ["indexed", "path", "both"],
+        "help":"Формат вывода результатов поиска: 'indexed', 'path' или 'both'."
+    },
+    "--sort_strategy": {
+        "type": str,
+        "default": "dfs",
+        "choices": ["dfs", "farthest_insertion", "christofides"],
+        "help": "Алгоритм построения начального пути: 'dfs' (по умолчанию), 'farthest_insertion', 'christofides'."
+    },
 }
 
 # --- Инициализация парсера и динамическое добавление аргументов ---

@@ -1,4 +1,6 @@
 import os
+import threading
+
 from cli import DEVICE, LOGGER
 from models import MODEL_CONFIGS
 import torch
@@ -48,7 +50,7 @@ def find_final_linear_module(model):
         
         
 def create_clip_openclip_model(model_name, cfg):
-    hook_blob = {}
+    hook_blob = {"tls": threading.local()}
     # open_clip backend (recommended for LAION weights / bigG/H variants)
     try:
         import open_clip
@@ -127,7 +129,7 @@ def create_clip_openclip_model(model_name, cfg):
     # hook for collecting features
     def _hook(module, input, output):
         # output is tensor (B,D)
-        hook_blob["feat"] = output.detach().cpu().clone()
+        hook_blob["tls"].feat = output.detach().cpu().clone()
     model.register_forward_hook(_hook)
 
     # determine feat_dim (use preprocess size if possible)
@@ -152,7 +154,7 @@ def create_clip_openclip_model(model_name, cfg):
 
 def create_clip_transformers_model(model_name, cfg):
     model_id = cfg["weights"]
-    hook_blob = {}
+    hook_blob = {"tls": threading.local()}
     # transformers backend (openai weights) — existing code, with small tweaks
     from transformers import CLIPModel, CLIPProcessor
     clip_model = CLIPModel.from_pretrained(model_id)
@@ -170,7 +172,7 @@ def create_clip_transformers_model(model_name, cfg):
     model = TFWrapper(clip_model)
 
     def _hook(module, input, output):
-        hook_blob["feat"] = output.detach().cpu().clone()
+        hook_blob["tls"].feat = output.detach().cpu().clone()
     model.register_forward_hook(_hook)
 
     # save processor as global in transformers-compatible form
@@ -283,14 +285,14 @@ def create_torchvision_model(model_name, cfg):
         LOGGER.error(f"Не удалось автоопределить feat_dim: {e}")
 
     # Вешаем hook
-    hook_blob = {}
+    hook_blob = {"tls": threading.local()}
     group, idx_or_name = setup_hook(model, cfg)
 
     # Получаем родительский модуль (например, model.classifier или model.head)
     target_module = determine_feature_dim(model,group,idx_or_name)
 
     def hook_fn(module, input, output):
-        hook_blob["feat"] = input[0].detach().cpu().clone()
+        hook_blob["tls"].feat = input[0].detach().cpu().clone()
     
     target_module.register_forward_hook(hook_fn)
 

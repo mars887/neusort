@@ -47,15 +47,27 @@ def extract_feature(path, model, hook_blob, config: Config):
             raise ValueError(f"Неизвестная модель: {config.model.model_name}")
 
     # --- вспомогательная функция: взять feat после forward (hook_blob должен быть заполнен) ---
+    def reset_hook_storage():
+        tls = hook_blob.get("tls")
+        if tls is not None:
+            setattr(tls, "feat", None)
+        elif "feat" in hook_blob:
+            del hook_blob["feat"]
+
     def fetch_feat_from_hook():
-        if "feat" not in hook_blob:
-            raise RuntimeError("hook_blob не заполнился — hook не сработал")
-        t = hook_blob["feat"]
-        # иногда hook сохраняет shape (1, D) либо (D,), приводим к 1D numpy float32
+        tls = hook_blob.get("tls")
+        t = getattr(tls, "feat", None) if tls is not None else hook_blob.get("feat")
+        if t is None:
+            raise RuntimeError("hook_blob �� ���������� � hook �� ��������")
+        # ������ hook ��������� shape (1, D) ���� (D,), �������� � 1D numpy float32
         if isinstance(t, torch.Tensor):
             arr = t.detach().cpu().numpy().reshape(-1).astype(np.float32)
         else:
             arr = np.asarray(t).reshape(-1).astype(np.float32)
+        if tls is not None:
+            setattr(tls, "feat", None)
+        else:
+            hook_blob.pop("feat", None)
         return arr
 
     # --- single crop режим ---
@@ -65,6 +77,7 @@ def extract_feature(path, model, hook_blob, config: Config):
             if clip_processor is not None:
                 inputs = clip_processor(images=img, return_tensors="pt")  # uses model's expected size
                 pixel_values = inputs["pixel_values"].to(DEVICE)
+                reset_hook_storage()
                 with torch.no_grad():
                     _ = model(pixel_values)
                 feat = fetch_feat_from_hook()
@@ -78,6 +91,7 @@ def extract_feature(path, model, hook_blob, config: Config):
                                          std=[0.26862954, 0.26130258, 0.27577711]),
                 ])
                 x = preproc(img).unsqueeze(0).to(DEVICE)
+                reset_hook_storage()
                 with torch.no_grad():
                     _ = model(x)
                 feat = fetch_feat_from_hook()
@@ -134,6 +148,7 @@ def extract_feature(path, model, hook_blob, config: Config):
         if is_clip and clip_processor is not None:
             inputs = clip_processor(images=pil_img_crop, return_tensors="pt")
             pixel_values = inputs["pixel_values"].to(DEVICE)
+            reset_hook_storage()
             with torch.no_grad():
                 _ = model(pixel_values)
             f = fetch_feat_from_hook()
@@ -141,6 +156,7 @@ def extract_feature(path, model, hook_blob, config: Config):
             if resize_after_crop is not None:
                 pil_img_crop = resize_after_crop(pil_img_crop)
             x = final_transform(pil_img_crop).unsqueeze(0).to(DEVICE)
+            reset_hook_storage()
             with torch.no_grad():
                 _ = model(x)
             f = fetch_feat_from_hook()

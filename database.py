@@ -5,6 +5,8 @@
 # ---------------------------------------------------------------------------- #
 import os
 import sqlite3
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
 import torch
@@ -66,35 +68,53 @@ def process_and_cache_features(db_file, config: Config):
 
         LOGGER.info(f"Найдено {len(paths_to_process)} новых изображений для обработки.")
         
-        # 4. Обрабатываем новые файлы пакетами
+        # 4. Batch processing of image paths with optional threading
+        max_workers_global = max(1, getattr(config.model, "feature_workers", 1))
+        use_gpu = torch.cuda.is_available() and not config.model.use_cpu
+        if use_gpu and max_workers_global > 1:
+            LOGGER.info("GPU inference detected; forcing feature extraction to run sequentially to avoid CUDA thread contention.")
+            max_workers_global = 1
+        model_lock = threading.Lock() if max_workers_global > 1 else None
+
+        def _process_path(full_path):
+            try:
+                if model_lock is None:
+                    feat = extract_feature(full_path, model, hook, config)
+                else:
+                    with model_lock:
+                        feat = extract_feature(full_path, model, hook, config)
+                if feat is None:
+                    return None
+                safe_path = full_path.encode('utf-8', errors='replace').decode('utf-8')
+                feature_blob = sqlite3.Binary(feat.tobytes())
+                return safe_path, feature_blob
+            except Exception as e:
+                LOGGER.error(f" ! Error processing image {full_path}: {e}")
+                return None
+
         for i in range(0, len(paths_to_process), config.model.batch_size):
             batch_paths = paths_to_process[i:i + config.model.batch_size]
             batch_feats_data = []
-            
-            desc_text = f"Обработка пакета {i//config.model.batch_size + 1}/{(len(paths_to_process) + config.model.batch_size - 1)//config.model.batch_size}"
-            
-            for full_path in tqdm(batch_paths, desc=desc_text):
-                try:
-                    feat = extract_feature(full_path, model, hook, config)
-                    if feat is not None:
-                        # Готовим данные для вставки в БД
-                        safe_path = full_path.encode('utf-8', errors='replace').decode('utf-8')
-                        feature_blob = sqlite3.Binary(feat.tobytes())
-                        batch_feats_data.append((safe_path, feature_blob))
-                except Exception as e:
-                    LOGGER.error(f" ! Ошибка при обработке файла {full_path}: {e}")
+            desc_text = f"Batch {i//config.model.batch_size + 1}/{(len(paths_to_process) + config.model.batch_size - 1)//config.model.batch_size}"
+            max_workers = min(max_workers_global, len(batch_paths))
 
-            # 5. Сохраняем пакет в базу данных
-            if batch_feats_data:
-                try:
-                    cursor.executemany('''
-                        INSERT OR IGNORE INTO features (filename, features) VALUES (?, ?)
-                    ''', batch_feats_data)
-                    conn.commit()
-                    LOGGER.info(f"Успешно сохранено {len(batch_feats_data)} новых признаков в БД.")
-                except Exception as e:
-                    LOGGER.error(f" ! Ошибка при сохранении пакета в базу данных: {e}")
-                    conn.rollback()
+            if max_workers <= 1:
+                for full_path in tqdm(batch_paths, desc=desc_text):
+                    result = _process_path(full_path)
+                    if result is not None:
+                        batch_feats_data.append(result)
+            else:
+                with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                    futures = {executor.submit(_process_path, full_path): full_path for full_path in batch_paths}
+                    for future in tqdm(as_completed(futures), total=len(batch_paths), desc=desc_text):
+                        full_path = futures[future]
+                        try:
+                            result = future.result()
+                        except Exception as e:
+                            LOGGER.error(f" ! Error processing image {full_path}: {e}")
+                            continue
+                        if result is not None:
+                            batch_feats_data.append(result)
 
         del model
         if torch.cuda.is_available():

@@ -1,3 +1,5 @@
+import os
+
 class Config:
     def __init__(self, args):
         # Группа: Файлы и пути
@@ -16,6 +18,12 @@ class Config:
                 self.more_scan = args.more_scan
                 self.use_cpu = args.use_cpu
                 self.batch_size = args.image_batch_size  # Размер батча для изображений
+                requested_workers = getattr(args, 'feature_workers', None)
+                if requested_workers is None or requested_workers <= 0:
+                    cpu_count = os.cpu_count() or 1
+                    self.feature_workers = max(1, cpu_count)
+                else:
+                    self.feature_workers = max(1, requested_workers)
                 self.gpu_id = 0
         self.model = Model(args)
 

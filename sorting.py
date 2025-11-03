@@ -2,7 +2,6 @@
 #                       Алгоритмы для поиска пути                              #
 # ---------------------------------------------------------------------------- #
 
-from collections import defaultdict
 import time
 import numpy as np
 import torch
@@ -10,7 +9,7 @@ from tqdm.auto import tqdm
 
 import faiss
 from scipy.sparse import csr_matrix, coo_matrix
-from scipy.sparse.csgraph import minimum_spanning_tree, depth_first_order, connected_components
+from scipy.sparse.csgraph import minimum_spanning_tree, connected_components
 
 from config import Config
 from faiss_io import save_faiss_index
@@ -673,89 +672,255 @@ def farthest_insertion_path_clustered(
     LOGGER.info(f"    - total time: {time.perf_counter() - t_all0:.2f}s")
     return order
 
-def get_adj_list(mst):
-    adj = defaultdict(list)
-    rows, cols = mst.nonzero()
-    data = mst.data
-    for r, c, dist in zip(rows, cols, data):
-        adj[r].append((c, dist))
-        adj[c].append((r, dist))
-    return adj
-        
 
-def compute_greedy_walk_cost(start_node, adj, visited_in_main_dfs, depth):
-    total_cost = 0.0
-    current_node = start_node
-    visited_in_walk = visited_in_main_dfs.copy()
-    visited_in_walk.add(current_node)
+import heapq
 
-    for _ in range(depth // 2):
-        neighbors = [(nb, dist) for nb, dist in adj[current_node] if nb not in visited_in_walk]
-
-        if not neighbors:
-            break
-
-        # Находим все возможные пары узлов и их суммарные стоимости
-        min_pair_cost = float('inf')
-        best_pair = None
-
-        for nb1, dist1 in neighbors:
-            # Находим соседей второго узла
-            neighbors_of_nb1 = [(nb2, dist2) for nb2, dist2 in adj[nb1] if nb2 not in visited_in_walk and nb2 != current_node]
-            for nb2, dist2 in neighbors_of_nb1:
-                pair_cost = dist1 + dist2
-                if pair_cost < min_pair_cost:
-                    min_pair_cost = pair_cost
-                    best_pair = (nb1, nb2, dist1, dist2)
-
-        if best_pair is None:
-            break
-
-        next_node1, next_node2, dist1, dist2 = best_pair
-        total_cost += dist1 + dist2
-
-        # Обновляем текущий узел и добавляем посещенные узлы
-        current_node = next_node2
-        visited_in_walk.add(next_node1)
-        visited_in_walk.add(next_node2)
-
-    return total_cost
-
-
-def optimized_depth_first_order(mst, i_start, lookahead_depth, progress_callback=None):
-    n = mst.shape[0]
-    adj = get_adj_list(mst)
-    visited = np.zeros(n, dtype=bool)
-    path = []
-    stack = [i_start]
-    cost_cache = {}
-    
-    while stack:
-        node = stack.pop()
-        if visited[node]:
+def _mst_adj_arrays_safe(mst: csr_matrix):
+    """Смежность MST без дублей: берём только (u<v), добавляем двунаправленно, сортируем по весу."""
+    M = mst.maximum(mst.T).tocoo()
+    n = M.shape[0]
+    adj = [[] for _ in range(n)]
+    mask = M.row < M.col
+    for u, v, w in zip(M.row[mask], M.col[mask], M.data[mask]):
+        u = int(u); v = int(v); w = float(w)
+        if u == v: 
             continue
-        path.append(node)
-        visited[node] = True
-        
-        if progress_callback:
-            progress_callback(len(path))
+        adj[u].append((v, w))
+        adj[v].append((u, w))
+    for u in range(n):
+        adj[u].sort(key=lambda x: x[1])
+    return adj
 
-        unvisited_neighbors = [nb for nb, _ in adj[node] if not visited[nb]]
-        if unvisited_neighbors:
-            visited_nodes_set = set(np.where(visited)[0])
-            neighbor_costs = []
-            for nb in unvisited_neighbors:
-                if nb not in cost_cache:
-                    cost_cache[nb] = compute_greedy_walk_cost(nb, adj, visited_nodes_set, depth=lookahead_depth)
-                neighbor_costs.append((nb, cost_cache[nb]))
-            
-            sorted_neighbors = [nb for nb, cost in sorted(neighbor_costs, key=lambda x: x[1])]
-            stack.extend(sorted_neighbors[::-1])
-            
+def _graph_adj_arrays_symmetric(G: csr_matrix, max_neighbors: int = 16):
+    """
+    Смежность для общего графа (kNN): симметризуем, отсортировано по весу (возрастающе),
+    обрезаем до max_neighbors на узел (чтобы не раздувать кандидаты).
+    """
+    GG = G.maximum(G.T).tocsr()
+    n = GG.shape[0]
+    adj = [[] for _ in range(n)]
+    indptr, indices, data = GG.indptr, GG.indices, GG.data
+    for u in range(n):
+        start, end = indptr[u], indptr[u+1]
+        neigh = [(int(indices[i]), float(data[i])) for i in range(start, end) if int(indices[i]) != u]
+        neigh.sort(key=lambda x: x[1])
+        if max_neighbors is not None and max_neighbors > 0:
+            neigh = neigh[:max_neighbors]
+        adj[u] = neigh
+    return adj
+
+def _tree_center_weighted(adj):
+    """Центр (по диаметру) взвешенного дерева, два прохода."""
+    def farthest(src):
+        n = len(adj)
+        dist = np.full(n, np.inf, dtype=np.float64)
+        parent = np.full(n, -1, dtype=np.int64)
+        dist[src] = 0.0
+        pq = [(0.0, src)]
+        while pq:
+            d,u = heapq.heappop(pq)
+            if d > dist[u]: 
+                continue
+            for v,w in adj[u]:
+                nd = d + w
+                if nd < dist[v]:
+                    dist[v] = nd
+                    parent[v] = u
+                    heapq.heappush(pq, (nd, v))
+        a = int(np.argmax(dist))
+        return a, dist, parent
+
+    a, _, _ = farthest(0)
+    b, dist, parent = farthest(a)
+    path = []
+    cur = b
+    while cur != -1:
+        path.append(cur); cur = parent[cur]
+    path.reverse()
+    total = float(dist[b]); half = total/2.0
+    acc = 0.0; center = path[0]
+    for i in range(1, len(path)):
+        u, v = path[i-1], path[i]
+        w = next(w for to,w in adj[u] if to == v)
+        if acc + w >= half:
+            center = v if (half - acc) > (acc + w - half) else u
+            break
+        acc += w
+    return int(center)
+
+def _subtree_sizes(adj, root):
+    """Размеры поддеревьев (rooted)."""
+    n = len(adj)
+    parent = np.full(n, -1, dtype=np.int64)
+    order = []
+    st = [root]; parent[root] = root
+    while st:
+        u = st.pop(); order.append(u)
+        for v,_ in adj[u]:
+            if parent[v] == -1:
+                parent[v] = u; st.append(v)
+    sizes = np.ones(n, dtype=np.int64)
+    for u in reversed(order):
+        for v,_ in adj[u]:
+            if parent[v] == u:
+                sizes[u] += sizes[v]
+    parent[root] = -1
+    return parent, sizes
+
+def optimized_depth_first_order_v2(mst: csr_matrix,
+                                   start_node: int = None,
+                                   lookahead_depth: int = 2,
+                                   beam_width: int = 3,
+                                   progress_callback=None):
+    """
+    Улучшенный DFS по MST (без потери покрытия):
+      • старт из центра дерева (если start_node=None),
+      • соседи отсортированы по весу,
+      • приоритет «тяжёлых» поддеревьев + 1-шаговый lookahead,
+      • beam только задаёт ПОРЯДОК, но ВСЕ соседи посещаются (никакого прюнинга).
+    Возвращает: (order, visited_mask) — order покрывает все вершины компоненты.
+    """
+    # 1) смежность
+    adj = _mst_adj_arrays_safe(mst)
+    n = len(adj)
+    if n == 0:
+        return np.empty(0, dtype=np.int64), np.zeros(0, dtype=bool)
+
+    # 2) старт
+    if start_node is None or not (0 <= int(start_node) < n):
+        start_node = _tree_center_weighted(adj)
+
+    # 3) precompute sizes
+    parent, sizes = _subtree_sizes(adj, start_node)
+
+    visited = np.zeros(n, dtype=bool)
+    order   = []
+
+    def score(cur, nxt):
+        # вес ребра
+        w = next(w for v,w in adj[cur] if v == nxt)
+        # «тяжесть» (больше поддерево — раньше идём)
+        heavy = -float(sizes[nxt])
+        # lookahead: минимальный вес ребра дальше
+        mnext = np.inf
+        for v,w2 in adj[nxt]:
+            if not visited[v] and v != cur:
+                mnext = w2
+                break  # т.к. adj[nxt] отсортированы по весу
+        if mnext is np.inf:
+            mnext = 0.0
+        return w + 0.3*mnext + 1e-4*heavy
+
+    stack = [int(start_node)]
+    processed_last = -1
+
+    while stack:
+        u = stack.pop()
+        if visited[u]:
+            continue
+        visited[u] = True
+        order.append(u)
+
+        if progress_callback:
+            processed = len(order)
+            if processed != processed_last:
+                progress_callback(processed)
+                processed_last = processed
+
+        # непосещённые соседи
+        cands = [v for v,_ in adj[u] if not visited[v]]
+        if not cands:
+            continue
+
+        # сортировка по score
+        cands.sort(key=lambda v: score(u, v))
+        # BEAM как приоритет: сначала top-beam, потом остальные
+        bw = max(1, int(beam_width))
+        primary = cands[:bw]
+        backlog = cands[bw:]
+        # кладём в стек так, чтобы первым пошёл лучший
+        for v in reversed(backlog):
+            stack.append(v)
+        for v in reversed(primary):
+            stack.append(v)
+
     if progress_callback:
-        progress_callback(len(path), final_update=True)
-            
-    return np.array(path), visited
+        progress_callback(len(order), final_update=True)
+
+    # safety: если вдруг что-то не дошли (не должно случиться на дереве) — допройдём plain-DFS
+    if not np.all(visited):
+        rem = np.where(~visited)[0].tolist()
+        for s in rem:
+            if visited[s]:
+                continue
+            # обычный стек без beam, только чтобы добрать компоненты
+            st = [s]
+            while st:
+                u = st.pop()
+                if visited[u]:
+                    continue
+                visited[u] = True
+                order.append(u)
+                for v,_ in adj[u]:
+                    if not visited[v]:
+                        st.append(v)
+
+    return np.asarray(order, dtype=np.int64), visited
+
+def dfs_polish(order_local, X, window=128, passes=2, focus_top=300):
+    """
+    Локальный 2-opt по окнам.
+    Если focus_top>0 — сначала обрабатываем окна вокруг top-длинных рёбер.
+    """
+    N = order_local.size
+    if N < 4:
+        return order_local
+    P = order_local.copy()
+
+    # найдём топ длинных рёбер
+    seg = np.linalg.norm(X[P][1:] - X[P][:-1], axis=1)
+    if focus_top and seg.size > 0:
+        idx = np.argsort(seg)[::-1][:min(focus_top, seg.size)]
+        # превратим в список окон (l..r), мерджим пересекающиеся
+        windows = []
+        for i in idx:
+            l = max(0, i - window//2)
+            r = min(N, i + window//2)
+            windows.append((l,r))
+        # слияние интервалов
+        windows.sort()
+        merged = []
+        for l,r in windows:
+            if not merged or l > merged[-1][1]:
+                merged.append([l,r])
+            else:
+                merged[-1][1] = max(merged[-1][1], r)
+        win_list = [(l,r) for l,r in merged]
+    else:
+        win_list = [(0,N)]
+
+    for _ in range(passes):
+        for l,r in win_list:
+            if r-l < 4: 
+                continue
+            seg_idx = np.arange(l, r)
+            block = P[seg_idx]
+            best_gain = 0.0; best = None
+            # разрежённый перебор
+            for a in range(1, block.size-2, 6):
+                u1, v1 = block[a-1], block[a]
+                for b in range(a+14, block.size-1, 6):
+                    u2, v2 = block[b], block[b+1] if b+1 < block.size else None
+                    before = np.linalg.norm(X[u1]-X[v1]) + (np.linalg.norm(X[u2]-X[v2]) if v2 is not None else 0.0)
+                    after  = np.linalg.norm(X[u1]-X[u2]) + (np.linalg.norm(X[v1]-X[v2]) if v2 is not None else 0.0)
+                    gain = before - after
+                    if gain > best_gain:
+                        best_gain = gain; best = (l+a, l+b)
+            if best:
+                a, b = best
+                P[a:b+1] = P[a:b+1][::-1]
+    return P
+
 
 
 def sort_by_ann_mst(feats: np.ndarray, k: int, config: Config):
@@ -909,54 +1074,113 @@ def sort_by_ann_mst(feats: np.ndarray, k: int, config: Config):
             
             start_node = main_nodes_indices[0]
             
-            strategy = config.sorting.strategy
-            if strategy == "dfs":
-                LOOKAHEAD_DEPTH = config.sorting.lookahead
-                if LOOKAHEAD_DEPTH <= 1:
-                    LOGGER.info(f"  - Стратегия 'dfs' с глубиной <= 1. Используется стандартный DFS.")
-                    from scipy.sparse.csgraph import depth_first_order
-                    main_path_indices, _ = depth_first_order(mst, i_start=start_node, directed=False)
-                    main_path = main_path_indices[main_path_indices != -1]
-                    LOGGER.info(f"    - Стандартный DFS завершен.")
-                else:
-                    LOGGER.info(f"  - Стратегия 'dfs' с глубиной {LOOKAHEAD_DEPTH}. Используется DFS с lookahead-оптимизацией.")
-                    last_reported_percent = -1
-                    def report_progress(processed_count, final_update=False):
-                        nonlocal last_reported_percent
-                        percent_done = int((processed_count / total_in_main_component) * 100)
-                        if percent_done > last_reported_percent or final_update:
-                            LOGGER.info(f"    - Прогресс: {processed_count} / {total_in_main_component} узлов ({percent_done}%)", end='\r')
-                            last_reported_percent = percent_done
-                    main_path, _ = optimized_depth_first_order(
-                        mst, 
-                        start_node, 
-                        lookahead_depth=LOOKAHEAD_DEPTH,
-                        progress_callback=report_progress
-                    )
-                    LOGGER.info("") # Перенос строки после прогресс-бара
+            # --- выбор стратегии для основной компоненты ---
+            strategy = str(getattr(config.sorting, "strategy", "dfs")).lower()
 
+            # сабматрица MST по основной компоненте (локальные индексы 0..M-1)
+            mst_main = mst[main_nodes_indices, :][:, main_nodes_indices]
+            X_main   = feats_copy[main_nodes_indices].astype(np.float32, copy=False)
+            M        = mst_main.shape[0]
+
+            # безопасный прогресс-логгер (без nonlocal/global)
+            def make_progress_logger(total, logger):
+                state = {"last": -1}
+                def report(processed_count, final_update=False):
+                    pct = int((processed_count * 100) / max(1, total))
+                    if pct > state["last"] or final_update:
+                        logger.info(f"    - Прогресс: {processed_count} / {total} узлов ({pct}%)", end='\r')
+                        state["last"] = pct
+                return report
+
+            report_progress_local = make_progress_logger(M, LOGGER)
+
+            order_local = None
+
+            if strategy == "dfs":
+                LOOKAHEAD_DEPTH = int(getattr(config.sorting, "lookahead", 1))
+                if LOOKAHEAD_DEPTH <= 1:
+                    from scipy.sparse.csgraph import depth_first_order
+                    LOGGER.info("  - Стратегия 'dfs' с глубиной <= 1. Стандартный DFS (локально по компоненте).")
+                    # старт в локальных координатах (если глобальный задан — приведём)
+                    try:
+                        if start_node is not None:
+                            pos = np.where(main_nodes_indices == int(start_node))[0]
+                            start_local = int(pos[0]) if pos.size > 0 else 0
+                        else:
+                            start_local = 0
+                    except Exception:
+                        start_local = 0
+                    main_path_indices, _ = depth_first_order(mst_main, i_start=start_local, directed=False)
+                    order_local = main_path_indices[main_path_indices != -1]
+                    LOGGER.info("    - Стандартный DFS завершен.")
+                else:
+                    LOGGER.info(f"  - Стратегия 'dfs' с глубиной {LOOKAHEAD_DEPTH}. DFS v2 (центр+heavy-path+beam).")
+                    beam_width = int(getattr(config.sorting, "beam_width", 3))
+                    order_local, visited = optimized_depth_first_order_v2(
+                        mst_main,
+                        start_node=None,
+                        lookahead_depth=LOOKAHEAD_DEPTH,
+                        beam_width=beam_width,
+                        progress_callback=report_progress_local
+                    )
+                    LOGGER.info("")  # перенос строки
+                    if not np.all(visited):
+                        missing = np.flatnonzero(~visited)
+                        LOGGER.warning(f"    - dfs v2: добираем {missing.size} узлов.")
+                        order_local = np.concatenate([order_local, missing])
             elif strategy == "farthest_insertion":
-                LOGGER.info(f"  - Стратегия 'farthest_insertion'. Запуск алгоритма...")
-                # Извлекаем подмножество фич для основной компоненты
-                main_feats = feats_copy[main_nodes_indices]
-                # --- ВЫЗЫВАЕМ ОПТИМИЗИРОВАННУЮ ФУНКЦИЮ, КОТОРАЯ НЕ СТРОИТ ПОЛНУЮ МАТРИЦУ ---
-                # Получаем путь в локальных индексах (0..M-1)
-                local_path = farthest_insertion_path_clustered(main_feats,config)  # Передаем массив признаков, а не матрицу расстояний
-                # Преобразуем локальные индексы обратно в глобальные
-                main_path = main_nodes_indices[local_path]
-                LOGGER.info(f"    - Farthest Insertion завершен.")
-            else: # strategy == "christofides" (заглушка)
-                LOGGER.info(f"  - Стратегия 'christofides' пока не реализована. Используется стандартный DFS.")
+
+                LOGGER.info("  - Стратегия 'farthest_insertion'. Запуск...")
+                order_local = farthest_insertion_path_clustered(X_main, config)
+                LOGGER.info("    - Farthest Insertion завершен.")
+
+            else:
+                LOGGER.info(f"  - Стратегия '{strategy}' не распознана. Фоллбек: стандартный DFS.")
                 from scipy.sparse.csgraph import depth_first_order
-                main_path_indices, _ = depth_first_order(mst, i_start=start_node, directed=False)
-                main_path = main_path_indices[main_path_indices != -1]
-            
+                main_path_indices, _ = depth_first_order(mst_main, i_start=0, directed=False)
+                order_local = main_path_indices[main_path_indices != -1]
+
+            # --- опциональная полировка пути для dfs-веток ---
+            enable_polish = bool(getattr(config.sorting, "enable_dfs_polish", False))
+            if enable_polish and strategy == "dfs":
+                pw   = int(getattr(config.sorting, "dfs_polish_window", 136))
+                pp   = int(getattr(config.sorting, "dfs_polish_passes", 2))
+                ftop = int(getattr(config.sorting, "dfs_polish_focus_top", 300))
+                if order_local.size > 1:
+                    pre_len = float(np.linalg.norm(X_main[order_local][1:] - X_main[order_local][:-1], axis=1).sum())
+                order_local = dfs_polish(order_local, X_main, window=pw, passes=pp, focus_top=ftop)
+                if order_local.size > 1:
+                    post_len = float(np.linalg.norm(X_main[order_local][1:] - X_main[order_local][:-1], axis=1).sum())
+                    LOGGER.info(f"    - dfs-polish: window={pw}, passes={pp}, top={ftop}; Δsum={pre_len - post_len:.3f}")
+
+            # --- интегрити-чек локального порядка ---
+            if order_local is None or order_local.size != M:
+                LOGGER.error(f"    - INTEGRITY: размер порядка {0 if order_local is None else order_local.size} != {M}; чиню.")
+                if order_local is None:
+                    order_local = np.arange(M, dtype=np.int64)
+                else:
+                    seen = np.zeros(M, dtype=bool)
+                    clean = []
+                    for v in order_local:
+                        if 0 <= v < M and not seen[v]:
+                            clean.append(int(v)); seen[v] = True
+                    missing = np.where(~seen)[0]
+                    order_local = np.asarray(clean + missing.tolist(), dtype=np.int64)
+
+            if order_local.min() < 0 or order_local.max() >= M:
+                LOGGER.error(f"    - INTEGRITY: значения вне [0,{M-1}] (min={order_local.min()}, max={order_local.max()}); clip.")
+                order_local = np.clip(order_local, 0, M-1)
+
+            # --- метрики считаем ЛОКАЛЬНО ---
+            metrics = evaluate_order_metrics(order=order_local, X=X_main, labels=None)
+            print(metrics)
+
+            # --- глобальный путь для последующих шагов ---
+            main_path = main_nodes_indices[order_local]
             LOGGER.info(f"  - Основная компонента обработана. Длина основного пути: {len(main_path)}.")
 
-            order_local = to_local_order(main_path, main_nodes_indices, feats_copy.shape[0])
-            metrics = evaluate_order_metrics(order_local, feats_copy[main_nodes_indices], labels=None)
 
-            print(metrics)
+
         else:
             # Редкий случай, если граф пуст
             LOGGER.info("  - Не найдено ни одной компоненты. Основной путь пуст.")

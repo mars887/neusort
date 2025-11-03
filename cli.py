@@ -74,6 +74,11 @@ PROGRAMM_ARGS = {
         "default": 1024,
         "help": "Количество файлов для обработки перед сохранением в БД."
     },
+    "--feature_workers": {
+        "type": int,
+        "default": None,
+        "help": ""
+    },
     "--neighbors_k_limit": {
         "type": int,
         "default": 1024,
@@ -122,7 +127,7 @@ PROGRAMM_ARGS = {
     "--loglevel": {
         "type": str,
         "default": 'default',
-        "choices": ["default", "error", "quiet"],
+        "choices": ["default", "error", "quiet", "debug"],
         "help": "Уровень детализации логирования."
     },
     "--find_result_type": {
@@ -133,9 +138,19 @@ PROGRAMM_ARGS = {
     },
     "--sort_strategy": {
         "type": str,
-        "default": "dfs",
+        "default": "farthest_insertion",
         "choices": ["dfs", "farthest_insertion", "christofides"],
         "help": "Алгоритм построения начального пути: 'dfs' (по умолчанию), 'farthest_insertion', 'christofides'."
+    },
+    "--list_objects": {
+        "action": "store_true",
+        "help": "List every file path currently stored in the features database."
+    },
+    "--move_db": {
+        "nargs": 2,
+        "metavar": ("OLD_ROOT", "NEW_ROOT"),
+        "type": str,
+        "help": "Move images from OLD_ROOT to NEW_ROOT and update their paths in the database."
     },
 }
 

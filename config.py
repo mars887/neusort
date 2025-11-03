@@ -70,4 +70,6 @@ class Config:
             def __init__(self, args):
                 self.log_level = args.loglevel
                 self.list_only = args.list_only
+                self.list_objects = getattr(args, "list_objects", False)
+                self.move_db = getattr(args, "move_db", None)
         self.misc = Misc(args)

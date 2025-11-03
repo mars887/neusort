@@ -1,4 +1,5 @@
 import os
+import sys
 
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
@@ -8,6 +9,7 @@ os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 
 from cli import CONFIG, LOGGER
 from core import run_sorting_pipeline, run_search_pipeline
+from database import list_database_files, move_database_entries
 
 if __name__ == "__main__":
 
@@ -22,6 +24,26 @@ if __name__ == "__main__":
     scan_suffix = "_more_scan" if CONFIG.model.more_scan else ""
     DB_FILE = f"features_db_{safe_model_name}{scan_suffix}.sqlite"
     INDEX_FILE = CONFIG.files.index_file
+
+    performed_action = False
+
+    if CONFIG.misc.move_db:
+        old_root, new_root = CONFIG.misc.move_db
+        moved, skipped, missing = move_database_entries(DB_FILE, old_root, new_root)
+        LOGGER.info(f"move_db summary -> moved: {moved}, skipped: {skipped}, missing: {missing}")
+        performed_action = True
+
+    if CONFIG.misc.list_objects:
+        paths = list_database_files(DB_FILE)
+        if paths:
+            for item in paths:
+                print(item)
+        else:
+            LOGGER.info("No files found in the database.")
+        performed_action = True
+
+    if performed_action:
+        sys.exit(0)
 
     if not os.path.isdir(CONFIG.files.src_folder):
         LOGGER.error(f"Создайте папку {CONFIG.files.src_folder} и положите туда картинки.")

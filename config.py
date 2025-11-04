@@ -55,6 +55,23 @@ class Config:
 
         self.sorting = Sorting(args)
 
+        class Clustering:
+            def __init__(self, args):
+                self.enabled = bool(getattr(args, "cluster", False))
+                threshold = float(getattr(args, "threshold", 0.35))
+                self.threshold = threshold if threshold >= 0.0 else 0.0
+                percent = float(getattr(args, "similarity_percent", 50.0))
+                percent = max(0.0, min(100.0, percent))
+                self.similarity_percent = percent
+                self.similarity_ratio = percent / 100.0
+                min_size = int(getattr(args, "cluster_min_size", 2))
+                self.min_size = max(1, min_size)
+                naming_mode = str(getattr(args, "cluster_naming_mode", "default")).lower()
+                if naming_mode not in {"default", "distance", "distance_plus"}:
+                    naming_mode = "default"
+                self.naming_mode = naming_mode
+        self.clustering = Clustering(args)
+
         # Группа: Поиск соседей
         class Search:
             def __init__(self, args):
@@ -72,4 +89,5 @@ class Config:
                 self.list_only = args.list_only
                 self.list_objects = getattr(args, "list_objects", False)
                 self.move_db = getattr(args, "move_db", None)
+                self.cluster = getattr(args, "cluster", False)
         self.misc = Misc(args)

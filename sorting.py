@@ -2,6 +2,7 @@
 #                       Алгоритмы для поиска пути                              #
 # ---------------------------------------------------------------------------- #
 
+import os
 import time
 import numpy as np
 import torch
@@ -988,19 +989,55 @@ def sort_by_ann_mst(feats: np.ndarray, k: int, config: Config):
     step_start_time = time.time()
     LOGGER.info(f"\n[2/5] Шаг 2: Поиск {k} ближайших соседей...")
     try:
-        all_distances = []
-        all_indices = []
-        for i in tqdm(range(0, n, config.search.global_knn_batch_size), desc="  - Поиск k-NN (батчи)"):
-            end = min(i + config.search.global_knn_batch_size, n)
-            # Ищем k+1 соседа, так как первый результат - это сама точка
-            distances_batch, indices_batch = index.search(feats_copy[i:end], k + 1)
-            all_distances.append(distances_batch)
-            all_indices.append(indices_batch)
-        
-        # Для IndexFlatL2 возвращаются КВАДРАТЫ евклидовых расстояний.
-        # Переименуем для ясности.
-        distances_sq = np.vstack(all_distances)
-        indices = np.vstack(all_indices)
+        raw_batch_size = getattr(config.search, "global_knn_batch_size", 1)
+        try:
+            batch_size = int(raw_batch_size)
+        except (TypeError, ValueError):
+            batch_size = 1
+        batch_size = max(1, batch_size)
+        batch_ranges = [(start, min(start + batch_size, n)) for start in range(0, n, batch_size)]
+
+        distances_sq = np.empty((n, k + 1), dtype=np.float32)
+        indices = np.empty((n, k + 1), dtype=np.int64)
+
+        def search_batch(start: int, end: int):
+            """Execute FAISS search for the given slice in a worker thread."""
+            distances_batch, indices_batch = index.search(feats_copy[start:end], k + 1)
+            return start, end, distances_batch, indices_batch
+
+        requested_workers = getattr(config.sorting, "knn_workers", None)
+        try:
+            requested_workers = int(requested_workers)
+        except (TypeError, ValueError):
+            requested_workers = 0
+
+        if requested_workers <= 0:
+            cpu_count = os.cpu_count() or 1
+            max_workers = min(len(batch_ranges), cpu_count)
+        else:
+            max_workers = min(len(batch_ranges), max(1, requested_workers))
+        max_workers = max(1, max_workers)
+
+        LOGGER.info(f"  - K-NN worker threads: {max_workers}")
+
+        if not batch_ranges:
+            distances_sq = np.empty((0, k + 1), dtype=np.float32)
+            indices = np.empty((0, k + 1), dtype=np.int64)
+        elif max_workers == 1:
+            for start, end in tqdm(batch_ranges, desc="  - Поиск k-NN (батчи)"):
+                start_idx, end_idx, distances_batch, indices_batch = search_batch(start, end)
+                distances_sq[start_idx:end_idx] = np.asarray(distances_batch, dtype=np.float32)
+                indices[start_idx:end_idx] = np.asarray(indices_batch, dtype=np.int64)
+        else:
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = [executor.submit(search_batch, start, end) for start, end in batch_ranges]
+                with tqdm(total=len(futures), desc="  - Поиск k-NN (батчи)") as progress_bar:
+                    for future in as_completed(futures):
+                        start, end, distances_batch, indices_batch = future.result()
+                        distances_sq[start:end] = np.asarray(distances_batch, dtype=np.float32)
+                        indices[start:end] = np.asarray(indices_batch, dtype=np.int64)
+                        progress_bar.update(1)
+
         LOGGER.info(f"  - Поиск завершен. Размер матрицы индексов: {indices.shape}")
         LOGGER.info(f"  - Время на шаг 2: {time.time() - step_start_time:.2f} сек.")
     except Exception as e:

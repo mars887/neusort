@@ -66,7 +66,7 @@ PROGRAMM_ARGS = {
     },
     "--batch_size": {
         "type": int,
-        "default": 8192,
+        "default": 2048,
         "help": "Размер батча для операций поиска соседей в FAISS."
     },
     "--image_batch_size": {
@@ -151,6 +151,31 @@ PROGRAMM_ARGS = {
         "metavar": ("OLD_ROOT", "NEW_ROOT"),
         "type": str,
         "help": "Move images from OLD_ROOT to NEW_ROOT and update their paths in the database."
+    },
+    "--cluster": {
+        "action": "store_true",
+        "help": "Group images into clusters based on feature distance threshold."
+    },
+    "--threshold": {
+        "type": float,
+        "default": 0.35,
+        "help": "Maximum distance between images to consider them similar for clustering."
+    },
+    "--similarity_percent": {
+        "type": float,
+        "default": 50.0,
+        "help": "Percentage of existing cluster images that must be within threshold for a new image to join."
+    },
+    "--cluster_min_size": {
+        "type": int,
+        "default": 2,
+        "help": "Minimum number of images required for a group to be treated as a cluster."
+    },
+    "--cluster_naming_mode": {
+        "type": str,
+        "default": "default",
+        "choices": ["default", "distance", "distance_plus"],
+        "help": "Controls how cluster folders and files are named: default numbering or distance-based variants."
     },
 }
 

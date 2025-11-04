@@ -8,7 +8,7 @@ os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 
 
 from cli import CONFIG, LOGGER
-from core import run_sorting_pipeline, run_search_pipeline
+from core import run_sorting_pipeline, run_search_pipeline, run_clustering_pipeline
 from database import list_database_files, move_database_entries
 
 if __name__ == "__main__":
@@ -50,7 +50,13 @@ if __name__ == "__main__":
         os.makedirs(CONFIG.files.src_folder, exist_ok=True)
         exit(1)
 
-    if CONFIG.search.find:
+    if CONFIG.clustering.enabled and CONFIG.search.find:
+        LOGGER.error("Options --cluster and --find cannot be used together.")
+        sys.exit(1)
+
+    if CONFIG.clustering.enabled:
+        run_clustering_pipeline(CONFIG, DB_FILE, INDEX_FILE)
+    elif CONFIG.search.find:
         run_search_pipeline(CONFIG, DB_FILE, INDEX_FILE)
     else:
         run_sorting_pipeline(CONFIG, DB_FILE, INDEX_FILE)

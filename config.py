@@ -1,5 +1,8 @@
 import os
 
+TRUE_STRINGS = {'1', 'true', 'yes', 'on'}
+FALSE_STRINGS = {'0', 'false', 'no', 'off'}
+
 class Config:
     def __init__(self, args):
         # Группа: Файлы и пути
@@ -70,6 +73,26 @@ class Config:
                 if naming_mode not in {"default", "distance", "distance_plus"}:
                     naming_mode = "default"
                 self.naming_mode = naming_mode
+                raw_save_mode = getattr(args, "save_mode", "default")
+                save_mode = str(raw_save_mode).lower()
+                if save_mode not in {"default", "json", "print"}:
+                    save_mode = "default"
+                self.save_mode = save_mode
+                raw_discarded = getattr(args, "save_discarded", "true")
+                if isinstance(raw_discarded, bool):
+                    save_discarded = raw_discarded
+                elif isinstance(raw_discarded, str):
+                    lowered = raw_discarded.strip().lower()
+                    if lowered in TRUE_STRINGS:
+                        save_discarded = True
+                    elif lowered in FALSE_STRINGS:
+                        save_discarded = False
+                    else:
+                        save_discarded = True
+                else:
+                    save_discarded = bool(raw_discarded)
+                self.save_discarded = save_discarded
+                
         self.clustering = Clustering(args)
 
         # Группа: Поиск соседей

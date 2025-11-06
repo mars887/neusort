@@ -202,12 +202,27 @@ def export_clusters(
 ) -> Tuple[str, int, int]:
     """Persist cluster results to disk and return summary stats."""
     base_dir = config.files.dst_folder
-    os.makedirs(base_dir, exist_ok=True)
+    save_mode = str(getattr(config.clustering, "save_mode", "default")).lower()
+    if save_mode not in {"default", "json", "print"}:
+        save_mode = "default"
+    raw_discard_flag = getattr(config.clustering, "save_discarded", True)
+    if isinstance(raw_discard_flag, str):
+        lowered_flag = raw_discard_flag.strip().lower()
+        save_discarded = lowered_flag not in {"0", "false", "no", "off"}
+    else:
+        save_discarded = bool(raw_discard_flag)
+
+    if save_mode in {"default", "json"}:
+        os.makedirs(base_dir, exist_ok=True)
 
     naming_mode = getattr(config.clustering, "naming_mode", "default")
-    compute_distances = naming_mode in {"distance", "distance_plus"}
+    # JSON/print modes require distance statistics even if the naming mode would not.
+    compute_distances = naming_mode in {"distance", "distance_plus"} or save_mode in {"json", "print"}
 
     clusters_summary: List[dict] = []
+    need_alt_output = save_mode in {"json", "print"}
+    alt_clusters: List[dict] = []
+    file_id_map: dict = {} if need_alt_output else {}
 
     for idx, cluster in enumerate(result.clusters, start=1):
         cluster_paths = [paths[item] for item in cluster]
@@ -229,20 +244,23 @@ def export_clusters(
             folder_name = f"{idx:03d}-{_format_distance(cluster_avg)}"
 
         cluster_dir = os.path.join(base_dir, folder_name)
-        saved_names: List[str] = []
+        distance_names: List[str] = []
+        if naming_mode in {"distance", "distance_plus"} and per_item_avg is not None and len(cluster) > 0:
+            distance_names = _build_distance_based_names(paths, cluster, per_item_avg)
+        saved_names: List[str] = list(distance_names) if distance_names else []
 
-        if not config.misc.list_only:
-            if naming_mode in {"distance", "distance_plus"} and per_item_avg is not None:
-                names = _build_distance_based_names(paths, cluster, per_item_avg)
-                _copy_with_custom_names(paths, cluster, names, cluster_dir, config)
-                saved_names = list(names)
-                if naming_mode == "distance_plus" and dist_matrix is not None:
-                    _write_pairwise_json(cluster_dir, dist_matrix)
-            else:
-                copy_and_rename(paths, cluster, cluster_dir, config)
-        else:
-            if naming_mode in {"distance", "distance_plus"} and per_item_avg is not None:
-                saved_names = _build_distance_based_names(paths, cluster, per_item_avg)
+        if save_mode == "default":
+            if not config.misc.list_only:
+                if distance_names:
+                    _copy_with_custom_names(paths, cluster, distance_names, cluster_dir, config)
+                    if naming_mode == "distance_plus" and dist_matrix is not None and dist_matrix.size > 0:
+                        _write_pairwise_json(cluster_dir, dist_matrix)
+                else:
+                    copy_and_rename(paths, cluster, cluster_dir, config)
+            elif distance_names:
+                saved_names = list(distance_names)
+        elif distance_names and config.misc.list_only:
+            saved_names = list(distance_names)
 
         cluster_entry = {
             "id": idx,
@@ -263,33 +281,111 @@ def export_clusters(
             items.append(item_info)
         cluster_entry["items"] = items
 
-        if naming_mode == "distance_plus" and not config.misc.list_only and len(cluster_paths) > 0:
+        if (
+            naming_mode == "distance_plus"
+            and save_mode == "default"
+            and not config.misc.list_only
+            and len(cluster_paths) > 0
+        ):
             cluster_entry["pairwise_json"] = os.path.join(folder_name, "cluster_distances.json")
 
         clusters_summary.append(cluster_entry)
 
-    if not config.misc.list_only and result.discarded:
+        if need_alt_output:
+            alt_items = []
+            for local_idx, original_idx in enumerate(cluster):
+                item_path = paths[original_idx]
+                if item_path not in file_id_map:
+                    file_id_map[item_path] = len(file_id_map) + 1
+                file_id = file_id_map[item_path]
+                item_entry = {"file_id": file_id}
+                if per_item_avg is not None and local_idx < len(per_item_avg):
+                    item_entry["average_distance"] = float(per_item_avg[local_idx])
+                if saved_names:
+                    item_entry["file_name"] = saved_names[local_idx]
+                alt_items.append(item_entry)
+
+            cluster_alt = {
+                "id": idx,
+                "size": len(cluster),
+                "items": alt_items,
+            }
+            if cluster_avg is not None:
+                cluster_alt["average_distance"] = float(cluster_avg)
+
+            if naming_mode == "distance_plus" and dist_matrix is not None and dist_matrix.size > 0 and alt_items:
+                pairwise = {}
+                for local_idx, item_entry in enumerate(alt_items):
+                    related = {}
+                    for other_idx, other_entry in enumerate(alt_items):
+                        if other_idx == local_idx:
+                            continue
+                        related[str(other_entry["file_id"])] = float(dist_matrix[local_idx, other_idx])
+                    pairwise[str(item_entry["file_id"])] = related
+                cluster_alt["pairwise_distances"] = pairwise
+
+            alt_clusters.append(cluster_alt)
+
+    if save_mode == "default" and not config.misc.list_only and result.discarded and save_discarded:
         noise_dir = os.path.join(base_dir, "unclustered")
         copy_and_rename(paths, result.discarded, noise_dir, config)
+    elif save_mode == "default" and not config.misc.list_only and result.discarded and not save_discarded:
+        LOGGER.info("Skipping save of unclustered images because --save_discarded=false was set.")
 
-    summary = {
-        "threshold": config.clustering.threshold,
-        "similarity_percent": config.clustering.similarity_percent,
-        "min_cluster_size": config.clustering.min_size,
-        "naming_mode": naming_mode,
-        "cluster_count": len(result.clusters),
-        "discarded_count": len(result.discarded),
-        "clusters": clusters_summary,
-        "discarded_paths": [paths[item] for item in result.discarded],
-    }
+    summary_path: str
 
-    summary_path = os.path.join(base_dir, "clusters.json")
-    with open(summary_path, "w", encoding="utf-8") as handle:
-        json.dump(summary, handle, ensure_ascii=False, indent=2)
+    if save_mode == "default":
+        summary = {
+            "threshold": config.clustering.threshold,
+            "similarity_percent": config.clustering.similarity_percent,
+            "min_cluster_size": config.clustering.min_size,
+            "naming_mode": naming_mode,
+            "cluster_count": len(result.clusters),
+            "discarded_count": len(result.discarded),
+            "clusters": clusters_summary,
+            "discarded_paths": [paths[item] for item in result.discarded],
+        }
+        summary_path = os.path.join(base_dir, "clusters.json")
+        with open(summary_path, "w", encoding="utf-8") as handle:
+            json.dump(summary, handle, ensure_ascii=False, indent=2)
 
-    if config.misc.list_only:
-        LOGGER.info(json.dumps(summary, ensure_ascii=False, indent=2))
-    else:
-        LOGGER.info(f"Cluster artifacts saved to: {base_dir}")
+        if config.misc.list_only:
+            LOGGER.info(json.dumps(summary, ensure_ascii=False, indent=2))
+        else:
+            LOGGER.info(f"Cluster artifacts saved to: {base_dir}")
+    elif save_mode == "json":
+        files_section = {path: file_id for path, file_id in sorted(file_id_map.items(), key=lambda item: item[1])}
+        payload = {
+            "files": files_section,
+            "clusters": alt_clusters,
+        }
+        summary_path = os.path.join(base_dir, "clusters.json")
+        with open(summary_path, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=2)
+        LOGGER.info(f"Cluster data saved to JSON: {summary_path}")
+    else:  # save_mode == "print"
+        summary_path = "<stdout>"
+        print("file,fileId")
+        for path, file_id in sorted(file_id_map.items(), key=lambda item: item[1]):
+            print(f"{path},{file_id}")
+        if alt_clusters:
+            print()
+        for cluster_alt in alt_clusters:
+            fields = [
+                f"cluster_{cluster_alt['id']:03d}",
+                f"{cluster_alt['size']}",
+            ]
+            avg_value = cluster_alt.get("average_distance")
+            if avg_value is not None:
+                fields.append(f"averageDist={avg_value:.6f}")
+            for item_entry in cluster_alt["items"]:
+                fields.append(str(item_entry["file_id"]))
+                avg_item = item_entry.get("average_distance")
+                if avg_item is not None:
+                    fields.append(f"{avg_item:.6f}")
+                else:
+                    fields.append("")
+            print(",".join(fields))
+        LOGGER.info("Cluster data printed to console in CSV format.")
 
     return summary_path, len(result.clusters), len(result.discarded)

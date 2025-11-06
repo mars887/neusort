@@ -1,3 +1,8 @@
+import os
+
+TRUE_STRINGS = {'1', 'true', 'yes', 'on'}
+FALSE_STRINGS = {'0', 'false', 'no', 'off'}
+
 class Config:
     def __init__(self, args):
         # Группа: Файлы и пути
@@ -16,6 +21,12 @@ class Config:
                 self.more_scan = args.more_scan
                 self.use_cpu = args.use_cpu
                 self.batch_size = args.image_batch_size  # Размер батча для изображений
+                requested_workers = getattr(args, 'feature_workers', None)
+                if requested_workers is None or requested_workers <= 0:
+                    cpu_count = os.cpu_count() or 1
+                    self.feature_workers = max(1, cpu_count)
+                else:
+                    self.feature_workers = max(1, requested_workers)
                 self.gpu_id = 0
         self.model = Model(args)
 
@@ -47,6 +58,43 @@ class Config:
 
         self.sorting = Sorting(args)
 
+        class Clustering:
+            def __init__(self, args):
+                self.enabled = bool(getattr(args, "cluster", False))
+                threshold = float(getattr(args, "threshold", 0.35))
+                self.threshold = threshold if threshold >= 0.0 else 0.0
+                percent = float(getattr(args, "similarity_percent", 50.0))
+                percent = max(0.0, min(100.0, percent))
+                self.similarity_percent = percent
+                self.similarity_ratio = percent / 100.0
+                min_size = int(getattr(args, "cluster_min_size", 2))
+                self.min_size = max(1, min_size)
+                naming_mode = str(getattr(args, "cluster_naming_mode", "default")).lower()
+                if naming_mode not in {"default", "distance", "distance_plus"}:
+                    naming_mode = "default"
+                self.naming_mode = naming_mode
+                raw_save_mode = getattr(args, "save_mode", "default")
+                save_mode = str(raw_save_mode).lower()
+                if save_mode not in {"default", "json", "print"}:
+                    save_mode = "default"
+                self.save_mode = save_mode
+                raw_discarded = getattr(args, "save_discarded", "true")
+                if isinstance(raw_discarded, bool):
+                    save_discarded = raw_discarded
+                elif isinstance(raw_discarded, str):
+                    lowered = raw_discarded.strip().lower()
+                    if lowered in TRUE_STRINGS:
+                        save_discarded = True
+                    elif lowered in FALSE_STRINGS:
+                        save_discarded = False
+                    else:
+                        save_discarded = True
+                else:
+                    save_discarded = bool(raw_discarded)
+                self.save_discarded = save_discarded
+                
+        self.clustering = Clustering(args)
+
         # Группа: Поиск соседей
         class Search:
             def __init__(self, args):
@@ -62,4 +110,7 @@ class Config:
             def __init__(self, args):
                 self.log_level = args.loglevel
                 self.list_only = args.list_only
+                self.list_objects = getattr(args, "list_objects", False)
+                self.move_db = getattr(args, "move_db", None)
+                self.cluster = getattr(args, "cluster", False)
         self.misc = Misc(args)

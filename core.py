@@ -6,6 +6,7 @@ from sorting import sort_images
 from search import handle_search_pipeline
 import faiss
 from cli import LOGGER
+from clustering import cluster_by_distance, export_clusters
 
 def run_sorting_pipeline(config, db_file, index_file):
     """
@@ -50,3 +51,24 @@ def run_search_pipeline(config, db_file, index_file):
 
     # Передаем управление в search.py
     handle_search_pipeline(config, feats, paths)
+
+
+def run_clustering_pipeline(config, db_file, index_file):
+    """
+    Pipeline for the --cluster mode.
+    """
+    use_gpu_faiss = (not config.model.use_cpu) and torch.cuda.is_available()
+
+    process_and_cache_features(db_file, config)
+
+    feats, paths = load_features_from_db(db_file)
+    if not paths or feats is None or len(paths) == 0:
+        LOGGER.error("Clustering aborted: no features found in the database.")
+        return
+
+    result = cluster_by_distance(feats, config, use_gpu_faiss)
+    summary_path, cluster_count, discarded_count = export_clusters(paths, feats, result, config)
+    LOGGER.info(
+        f"Clustering complete: {cluster_count} clusters saved. "
+        f"Summary written to: {summary_path}. Discarded items: {discarded_count}."
+    )

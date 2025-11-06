@@ -2,6 +2,11 @@
 #                              Аргументы и Конфигурация                        #
 # ---------------------------------------------------------------------------- #
 import argparse
+import re
+import sys
+import textwrap
+from typing import List, Tuple
+
 import torch
 from config import Config
 from logger import CustomLogger, LogLevel
@@ -66,13 +71,18 @@ PROGRAMM_ARGS = {
     },
     "--batch_size": {
         "type": int,
-        "default": 8192,
+        "default": 2048,
         "help": "Размер батча для операций поиска соседей в FAISS."
     },
     "--image_batch_size": {
         "type": int,
         "default": 1024,
         "help": "Количество файлов для обработки перед сохранением в БД."
+    },
+    "--feature_workers": {
+        "type": int,
+        "default": None,
+        "help": ""
     },
     "--neighbors_k_limit": {
         "type": int,
@@ -122,7 +132,7 @@ PROGRAMM_ARGS = {
     "--loglevel": {
         "type": str,
         "default": 'default',
-        "choices": ["default", "error", "quiet"],
+        "choices": ["default", "error", "quiet", "debug"],
         "help": "Уровень детализации логирования."
     },
     "--find_result_type": {
@@ -133,17 +143,327 @@ PROGRAMM_ARGS = {
     },
     "--sort_strategy": {
         "type": str,
-        "default": "dfs",
+        "default": "farthest_insertion",
         "choices": ["dfs", "farthest_insertion", "christofides"],
         "help": "Алгоритм построения начального пути: 'dfs' (по умолчанию), 'farthest_insertion', 'christofides'."
     },
+    "--list_objects": {
+        "action": "store_true",
+        "help": "List every file path currently stored in the features database."
+    },
+    "--move_db": {
+        "nargs": 2,
+        "metavar": ("OLD_ROOT", "NEW_ROOT"),
+        "type": str,
+        "help": "Move images from OLD_ROOT to NEW_ROOT and update their paths in the database."
+    },
+    "--cluster": {
+        "action": "store_true",
+        "help": "Group images into clusters based on feature distance threshold."
+    },
+    "--save_discarded": {
+        "type": str,
+        "default": "true",
+        "metavar": "BOOL",
+        "help": "Whether to save images that did not join any cluster. Accepts true/false values."
+    },
+    "--save_mode": {
+        "type": str,
+        "default": "default",
+        "choices": ["default", "json", "print"],
+        "help": "How to store clustering results: 'default' folders, 'json' file only, or 'print' to console."
+    },
+    "--threshold": {
+        "type": float,
+        "default": 0.35,
+        "help": "Maximum distance between images to consider them similar for clustering."
+    },
+    "--similarity_percent": {
+        "type": float,
+        "default": 50.0,
+        "help": "Percentage of existing cluster images that must be within threshold for a new image to join."
+    },
+    "--cluster_min_size": {
+        "type": int,
+        "default": 2,
+        "help": "Minimum number of images required for a group to be treated as a cluster."
+    },
+    "--cluster_naming_mode": {
+        "type": str,
+        "default": "default",
+        "choices": ["default", "distance", "distance_plus"],
+        "help": "Controls how cluster folders and files are named: default numbering or distance-based variants."
+    },
+
+
 }
+
+GROUP_VALUE_SPLIT_PATTERN = re.compile(r":(?=[A-Za-z0-9_\-]+(?:=|$))")
+TRUE_STRINGS = {"1", "true", "yes", "on"}
+FALSE_STRINGS = {"0", "false", "no", "off"}
+
+GROUPED_ARGUMENT_SPECS = {
+    "cluster": {
+        "options": ("--cluster",),
+        "primary": "--cluster",
+        "emit": "always",
+        "allow_no_value": True,
+        "subparams": {
+            "threshold": {"arg": "--threshold"},
+            "similarity_percent": {"arg": "--similarity_percent"},
+            "percent": {"arg": "--similarity_percent"},
+            "cluster_min_size": {"arg": "--cluster_min_size"},
+            "min_size": {"arg": "--cluster_min_size"},
+            "naming_mode": {"arg": "--cluster_naming_mode"},
+            "cluster_naming_mode": {"arg": "--cluster_naming_mode"},
+            "mode": {"arg": "--cluster_naming_mode"},
+            "save_discarded": {"arg": "--save_discarded"},
+            "save_mode": {"arg": "--save_mode"},
+        },
+    },
+    "model": {
+        "options": ("-m", "--model", "--model_name"),
+        "primary": "--model",
+        "emit": "when_self",
+        "allow_no_value": True,
+        "subparams": {
+            "name": {"target": "self"},
+            "model": {"target": "self"},
+            "cpu": {"arg": "--use_cpu", "type": "bool"},
+            "use_cpu": {"arg": "--use_cpu", "type": "bool"},
+            "more_scan": {"arg": "--more_scan", "type": "bool"},
+            "scan": {"arg": "--more_scan", "type": "bool"},
+            "image_batch": {"arg": "--image_batch_size"},
+            "image_batch_size": {"arg": "--image_batch_size"},
+            "batch_size": {"arg": "--image_batch_size"},
+            "feature_workers": {"arg": "--feature_workers"},
+            "workers": {"arg": "--feature_workers"},
+        },
+    },
+    "files": {
+        "options": ("--files",),
+        "primary": None,
+        "emit": "never",
+        "allow_no_value": False,
+        "subparams": {
+            "input": {"arg": "--input"},
+            "input_folder": {"arg": "--input"},
+            "output": {"arg": "--output"},
+            "output_folder": {"arg": "--output"},
+            "index": {"arg": "--index_file"},
+            "index_file": {"arg": "--index_file"},
+            "tsv": {"arg": "--out_tsv"},
+            "out_tsv": {"arg": "--out_tsv"},
+        },
+    },
+    "find": {
+        "options": ("--find",),
+        "primary": "--find",
+        "emit": "always",
+        "allow_no_value": True,
+        "subparams": {
+            "query": {"target": "self"},
+            "path": {"target": "self"},
+            "input": {"target": "self"},
+            "neighbors": {"arg": "--find_neighbors"},
+            "k": {"arg": "--find_neighbors"},
+            "tsv_neighbors": {"arg": "--tsv_neighbors"},
+            "batch_size": {"arg": "--batch_size"},
+            "result_type": {"arg": "--find_result_type"},
+            "format": {"arg": "--find_result_type"},
+        },
+    },
+    "sorting": {
+        "options": ("--sorting",),
+        "primary": None,
+        "emit": "never",
+        "allow_no_value": False,
+        "subparams": {
+            "optimizer": {"arg": "--sort_optimizer"},
+            "sort_optimizer": {"arg": "--sort_optimizer"},
+            "strategy": {"arg": "--sort_strategy"},
+            "sort_strategy": {"arg": "--sort_strategy"},
+            "lookahead": {"arg": "--lookahead"},
+            "neighbors_k_limit": {"arg": "--neighbors_k_limit"},
+            "two_opt_shift": {"arg": "--two_opt_shift"},
+            "two_opt_block_size": {"arg": "--two_opt_block_size"},
+        },
+    },
+    "misc": {
+        "options": ("--misc",),
+        "primary": None,
+        "emit": "never",
+        "allow_no_value": False,
+        "subparams": {
+            "loglevel": {"arg": "--loglevel"},
+            "list_only": {"arg": "--list_only", "type": "bool"},
+            "list_objects": {"arg": "--list_objects", "type": "bool"},
+        },
+    },
+    "database": {
+        "options": ("--database",),
+        "primary": None,
+        "emit": "never",
+        "allow_no_value": False,
+        "subparams": {
+            "move": {"arg": "--move_db", "type": "pair"},
+            "move_db": {"arg": "--move_db", "type": "pair"},
+            "list_objects": {"arg": "--list_objects", "type": "bool"},
+        },
+    },
+}
+
+OPTION_TO_GROUP = {
+    option: group_key
+    for group_key, spec in GROUPED_ARGUMENT_SPECS.items()
+    for option in spec["options"]
+}
+
+GROUPED_USAGE_HELP = textwrap.dedent(
+    """\
+Grouped argument shortcuts:
+  --cluster threshold=0.3:cluster_min_size=3
+  --model name=clip_vit_liaon:cpu=true:feature_workers=8
+  --files input=raw_data:output=sorted:tsv=neighbors.tsv
+  --find query=example.jpg:neighbors=10:result_type=path
+  --sorting strategy=dfs:optimizer=2opt
+  --misc loglevel=debug:list_only=true
+  --database move=old_root|new_root
+
+Repeat a group flag to add more values or avoid ':' when the value already contains it (e.g. on Windows paths use multiple --files entries).
+"""
+)
+
+
+def _fail_group_argument(message: str) -> None:
+    """Emit a consistent error for grouped argument parsing."""
+    sys.stderr.write(f"{message}\n")
+    sys.exit(2)
+
+
+def _split_group_items(raw: str) -> List[str]:
+    """Split a raw group value into individual key=value fragments."""
+    return [item.strip() for item in GROUP_VALUE_SPLIT_PATTERN.split(raw) if item.strip()]
+
+
+def _parse_bool(value: str) -> bool:
+    """Interpret a string as a boolean flag."""
+    if value == "" or value is None:
+        return True
+    lowered = value.lower()
+    if lowered in TRUE_STRINGS:
+        return True
+    if lowered in FALSE_STRINGS:
+        return False
+    _fail_group_argument(f"Unsupported boolean value '{value}'. Use one of {sorted(TRUE_STRINGS | FALSE_STRINGS)}.")
+    return False
+
+
+def _parse_pair(value: str, option_token: str, key: str) -> Tuple[str, str]:
+    """Parse a pair value separated by '|', '->', or ','."""
+    if not value:
+        _fail_group_argument(f"Sub-argument '{key}' for {option_token} requires two values.")
+    for separator in ("|", "->", ","):
+        if separator in value:
+            left, right = value.split(separator, 1)
+            left = left.strip()
+            right = right.strip()
+            if left and right:
+                return left, right
+    _fail_group_argument(
+        f"Sub-argument '{key}' for {option_token} expects two values separated by '|', '->', or ','."
+    )
+    return "", ""
+
+
+def _expand_group_argument(option_token: str, raw_value: str, spec: dict) -> Tuple[List[str], List[str]]:
+    """Expand grouped key=value entries into individual CLI tokens."""
+    primary_values: List[str] = []
+    extra_tokens: List[str] = []
+    for item in _split_group_items(raw_value):
+        if "=" in item:
+            key, value = item.split("=", 1)
+        else:
+            key, value = item, ""
+        key = key.strip().lower()
+        value = value.strip()
+        if not key:
+            _fail_group_argument(f"Invalid grouped argument fragment '{item}' for {option_token}.")
+        rule = spec["subparams"].get(key)
+        if rule is None:
+            _fail_group_argument(f"Unknown sub-argument '{key}' for {option_token}.")
+        target = rule.get("target")
+        if target == "self":
+            if not value:
+                _fail_group_argument(f"Sub-argument '{key}' for {option_token} requires a value.")
+            if primary_values:
+                _fail_group_argument(f"Multiple values specified for {option_token}; only one is allowed.")
+            primary_values.append(value)
+            continue
+        arg_name = rule["arg"]
+        type_hint = rule.get("type")
+        if type_hint == "bool":
+            should_enable = _parse_bool(value)
+            if should_enable:
+                if arg_name not in extra_tokens:
+                    extra_tokens.append(arg_name)
+            else:
+                extra_tokens = [token for token in extra_tokens if token != arg_name]
+        elif type_hint == "pair":
+            left, right = _parse_pair(value, option_token, key)
+            extra_tokens.append(arg_name)
+            extra_tokens.extend([left, right])
+        else:
+            if value == "":
+                _fail_group_argument(f"Sub-argument '{key}' for {option_token} requires a value.")
+            extra_tokens.append(arg_name)
+            extra_tokens.append(value)
+    return primary_values, extra_tokens
+
+
+def _normalize_group_args(raw_args: List[str]) -> List[str]:
+    """Translate grouped arguments into regular argparse-compatible tokens."""
+    normalized: List[str] = []
+    index = 0
+    while index < len(raw_args):
+        token = raw_args[index]
+        group_key = OPTION_TO_GROUP.get(token)
+        if group_key is None:
+            normalized.append(token)
+            index += 1
+            continue
+
+        spec = GROUPED_ARGUMENT_SPECS[group_key]
+        next_token = raw_args[index + 1] if (index + 1) < len(raw_args) else None
+        treat_as_group = next_token is not None and "=" in next_token
+        if not treat_as_group:
+            if spec.get("allow_no_value", False):
+                primary = spec.get("primary") or token
+                normalized.append(primary)
+                index += 1
+                continue
+            _fail_group_argument(f"{token} requires at least one key=value pair.")
+
+        primary_values, extra_tokens = _expand_group_argument(token, next_token, spec)
+        emit_mode = spec.get("emit", "always")
+        primary = spec.get("primary") or token
+        if emit_mode == "always":
+            normalized.append(primary)
+        elif emit_mode == "when_self" and primary_values:
+            normalized.append(primary)
+        # emit == "never" -> skip adding the group flag itself
+
+        normalized.extend(primary_values)
+        normalized.extend(extra_tokens)
+        index += 2
+    return normalized
 
 # --- Инициализация парсера и динамическое добавление аргументов ---
 parser = argparse.ArgumentParser(
-    description="Сортировка картинок по визуальной близости с выбором модели"
+    description="Сортировка картинок по визуальной близости с выбором модели",
+    formatter_class=argparse.RawDescriptionHelpFormatter,
+    epilog=GROUPED_USAGE_HELP,
 )
-
 for arg_name, config in PROGRAMM_ARGS.items():
     # Собираем все имена аргумента (основное + альтернативные)
     arg_names = [arg_name]
@@ -157,7 +477,8 @@ for arg_name, config in PROGRAMM_ARGS.items():
     parser.add_argument(*arg_names, **config_for_parser)
 
 # --- Парсинг аргументов ---
-args = parser.parse_args()
+normalized_cli_args = _normalize_group_args(sys.argv[1:])
+args = parser.parse_args(normalized_cli_args)
 
 LOGGER = CustomLogger(level = LogLevel(args.loglevel))
 CONFIG = Config(args)

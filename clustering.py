@@ -6,6 +6,10 @@ from dataclasses import dataclass
 from typing import List, Sequence, Tuple
 
 import faiss
+try:
+    import hdbscan  # type: ignore
+except Exception:  # pragma: no cover
+    hdbscan = None
 import numpy as np
 from tqdm.auto import tqdm
 
@@ -25,25 +29,140 @@ def _format_distance(value: float) -> str:
     return f"{value:.4f}"
 
 
-def _compute_cluster_distances(cluster_feats: np.ndarray) -> Tuple[np.ndarray, float, np.ndarray]:
-    """Compute pairwise distances, cluster average distance, and per-item averages."""
+def apply_pca_whitening(feats: np.ndarray, n_components: int, whiten: bool, log: bool = True) -> Tuple[np.ndarray, dict]:
+    """Apply PCA with optional whitening to features.
+
+    - Centers features to zero mean.
+    - Projects onto top `n_components` principal axes.
+    - If `whiten` is True, scales components by 1/sqrt(eigenvalue + eps),
+      so that Euclidean distance approximates Mahalanobis distance in original space.
+    - Returns transformed features (float32) and metadata dict.
+    """
+    x = feats.astype(np.float32, copy=False)
+    n, d = x.shape
+    if n == 0 or d == 0:
+        return x, {"enabled": False}
+
+    # Determine target dimensionality (cannot exceed rank n-1 or d)
+    k_max = max(1, min(d, n - 1))
+    k = max(1, min(int(n_components), k_max))
+
+    # Progress indicator
+    progress = tqdm(total=3, desc="PCA whitening", disable=not log)
+
+    # 1) Center
+    mean = np.mean(x, axis=0, dtype=np.float64)
+    xc = (x - mean).astype(np.float32, copy=False)
+    progress.update(1)
+
+    # 2) Covariance eigen-decomposition on float64 for stability
+    # cov = (xc^T xc) / (n-1)
+    cov = (xc.astype(np.float64, copy=False).T @ xc.astype(np.float64, copy=False)) / max(1, (n - 1))
+    # eigh returns ascending eigenvalues; reverse for descending order
+    evals, evecs = np.linalg.eigh(cov)
+    order = np.argsort(evals)[::-1]
+    evals = evals[order]
+    evecs = evecs[:, order]
+    progress.update(1)
+
+    # 3) Projection + optional whitening
+    components = evecs[:, :k].astype(np.float32, copy=False)
+    vals = evals[:k]
+    eps = 1e-8
+    if whiten:
+        scales = (1.0 / np.sqrt(np.maximum(vals, eps))).astype(np.float32, copy=False)
+        z = (xc @ components) * scales
+    else:
+        z = xc @ components
+    z = z.astype(np.float32, copy=False)
+    progress.update(1)
+    progress.close()
+
+    meta = {
+        "enabled": True,
+        "original_dim": int(d),
+        "n_samples": int(n),
+        "components": int(k),
+        "whiten": bool(whiten),
+    }
+    return z, meta
+
+
+def _compute_cluster_distances(
+    cluster_feats: np.ndarray,
+    max_items_for_matrix: int,
+    chunk_size: int,
+) -> Tuple[np.ndarray, float, np.ndarray]:
+    """Compute pairwise distances, cluster average distance, and per-item averages.
+
+    Memory-safe implementation:
+    - For small clusters (n <= max_items_for_matrix) compute the full n×n matrix with O(n^2) memory using Gram matrix.
+    - For large clusters, stream over blocks to compute per-item average distances and cluster average without holding the full matrix.
+      In this case, returns an empty distance matrix of shape (0, 0).
+    """
     if cluster_feats.size == 0:
         return np.zeros((0, 0), dtype=np.float32), 0.0, np.zeros((0,), dtype=np.float32)
 
-    feats32 = cluster_feats.astype(np.float32, copy=False)
-    diff = feats32[:, None, :] - feats32[None, :, :]
-    dist_matrix = np.linalg.norm(diff, axis=2)
-    size = dist_matrix.shape[0]
+    X = cluster_feats.astype(np.float32, copy=False)
+    n, d = X.shape
+    if n <= 1:
+        return np.zeros((n, n), dtype=np.float32), 0.0, np.zeros((n,), dtype=np.float32)
 
-    if size <= 1:
-        per_item_avg = np.zeros((size,), dtype=np.float32)
-        cluster_avg = 0.0
-    else:
-        upper = dist_matrix[np.triu_indices(size, k=1)]
+    # Small clusters: full matrix via Gram trick
+    if 0 <= max_items_for_matrix and n <= max_items_for_matrix:
+        # Compute squared norms and Gram matrix
+        sq = np.sum(X.astype(np.float64, copy=False) ** 2.0, axis=1)
+        G = (X.astype(np.float64, copy=False) @ X.astype(np.float64, copy=False).T)
+        D2 = sq[:, None] + sq[None, :] - 2.0 * G
+        np.maximum(D2, 0.0, out=D2)
+        D = np.sqrt(D2, dtype=np.float64).astype(np.float32)
+        upper = D[np.triu_indices(n, k=1)]
         cluster_avg = float(np.mean(upper)) if upper.size > 0 else 0.0
-        per_item_avg = dist_matrix.sum(axis=1) / (size - 1)
+        per_item_avg = (D.sum(axis=1) / (n - 1)).astype(np.float32, copy=False)
+        return D.astype(np.float32, copy=False), cluster_avg, per_item_avg
 
-    return dist_matrix, float(cluster_avg), per_item_avg.astype(np.float32, copy=False)
+    # Large clusters: stream by blocks to avoid O(n^2 * d) memory
+    bs = max(64, int(chunk_size))
+    sq = np.sum(X.astype(np.float64, copy=False) ** 2.0, axis=1)
+    per_sum = np.zeros(n, dtype=np.float64)
+    total_upper = 0.0
+
+    # Progress over block pairs roughly proportional to (n/bs)^2
+    steps_i = (n + bs - 1) // bs
+    show_progress = True  # caller decides via surrounding config; here we always show
+    progress = tqdm(total=steps_i, desc="Cluster distances (stream)")
+
+    for i0 in range(0, n, bs):
+        i1 = min(n, i0 + bs)
+        A = X[i0:i1].astype(np.float64, copy=False)
+        a_sq = sq[i0:i1]
+        for j0 in range(0, n, bs):
+            j1 = min(n, j0 + bs)
+            B = X[j0:j1].astype(np.float64, copy=False)
+            b_sq = sq[j0:j1]
+            G = A @ B.T
+            D2 = a_sq[:, None] + b_sq[None, :] - 2.0 * G
+            np.maximum(D2, 0.0, out=D2)
+            Dblock = np.sqrt(D2, dtype=np.float64)
+            # Accumulate per-row sums
+            per_sum[i0:i1] += Dblock.sum(axis=1)
+            # Accumulate upper-triangular sum for cluster average
+            if i0 == j0:
+                # only sum strictly upper triangle within block
+                m = i1 - i0
+                tri_i, tri_j = np.triu_indices(m, k=1)
+                total_upper += Dblock[tri_i, tri_j].sum()
+            elif i0 < j0:
+                total_upper += Dblock.sum()
+        if progress:
+            progress.update(1)
+    if progress:
+        progress.close()
+
+    per_item_avg = (per_sum / (n - 1)).astype(np.float32, copy=False)
+    denom = n * (n - 1) / 2.0
+    cluster_avg = float(total_upper / denom) if denom > 0 else 0.0
+    return np.zeros((0, 0), dtype=np.float32), cluster_avg, per_item_avg
 
 
 def _build_distance_based_names(paths: Sequence[str], indices: Sequence[int], per_item_avg: np.ndarray) -> List[str]:
@@ -135,12 +254,17 @@ def _build_neighbor_sets(feats: np.ndarray, threshold: float, use_gpu: bool) -> 
     return neighbors
 
 
-def _assign_clusters(neighbors: Sequence[set], similarity_ratio: float) -> List[List[int]]:
-    """Greedy assignment that respects the similarity ratio requirement."""
+def _assign_clusters(neighbors: Sequence[set], similarity_ratio: float, config: Config) -> List[List[int]]:
+    """Greedy assignment that respects the similarity ratio requirement, with progress display."""
     clusters: List[List[int]] = []
     similarity_ratio = max(0.0, min(1.0, similarity_ratio))
 
-    for idx, within_threshold in enumerate(neighbors):
+    show_progress = config.misc.log_level == "default"
+    iterator = range(len(neighbors))
+    progress = tqdm(total=len(neighbors), desc="Greedy clustering", disable=not show_progress)
+
+    for idx in iterator:
+        within_threshold = neighbors[idx]
         best_cluster = -1
         best_overlap = -1
 
@@ -155,6 +279,12 @@ def _assign_clusters(neighbors: Sequence[set], similarity_ratio: float) -> List[
             clusters.append([idx])
         else:
             clusters[best_cluster].append(idx)
+
+        if progress:
+            progress.update(1)
+
+    if progress:
+        progress.close()
     return clusters
 
 
@@ -169,7 +299,7 @@ def cluster_by_distance(feats: np.ndarray, config: Config, use_gpu: bool) -> Clu
         return ClusterResult(clusters=[], discarded=list(range(feats.shape[0])))
 
     neighbors = _build_neighbor_sets(feats, threshold, use_gpu)
-    raw_clusters = _assign_clusters(neighbors, similarity_ratio)
+    raw_clusters = _assign_clusters(neighbors, similarity_ratio, config)
 
     valid_clusters: List[List[int]] = []
     discarded: List[int] = []
@@ -190,6 +320,327 @@ def cluster_by_distance(feats: np.ndarray, config: Config, use_gpu: bool) -> Clu
 
     if discarded:
         LOGGER.info(f"Discarded {len(discarded)} images that did not meet minimum cluster size.")
+
+    return ClusterResult(clusters=valid_clusters, discarded=discarded)
+
+
+def cluster_by_hdbscan(feats: np.ndarray, config: Config) -> ClusterResult:
+    """Cluster embeddings using HDBSCAN for higher-accuracy density-based grouping.
+
+    Notes:
+    - This method ignores the distance `threshold` and `similarity_ratio` parameters.
+    - Uses `min_cluster_size` from config as HDBSCAN's `min_cluster_size`.
+    - Metric is set to 'euclidean' since features are L2-normalized.
+    - If the `hdbscan` package is unavailable, falls back to the distance-based method.
+    """
+    n = int(feats.shape[0])
+    if n == 0:
+        return ClusterResult(clusters=[], discarded=[])
+
+    if hdbscan is None:
+        LOGGER.error("HDBSCAN is not installed. Falling back to distance-based clustering.")
+        # Fallback to distance-based clustering in CPU mode for safety
+        return cluster_by_distance(feats, config, use_gpu=False)
+
+    feats32 = feats.astype(np.float32, copy=False)
+    min_cluster_size = max(1, int(config.clustering.min_size))
+
+    # Configure HDBSCAN with a robust default; `min_samples=None` => equals `min_cluster_size`.
+    clusterer = hdbscan.HDBSCAN(
+        min_cluster_size=min_cluster_size,
+        min_samples=None,
+        metric="euclidean",
+        cluster_selection_method="leaf",
+    )
+
+    # Show a minimal progress indicator as HDBSCAN runs internally.
+    show_progress = config.misc.log_level == "default"
+    progress = tqdm(total=1, desc="HDBSCAN fit", disable=not show_progress)
+    labels = clusterer.fit_predict(feats32)
+    if progress:
+        progress.update(1)
+        progress.close()
+
+    clusters_dict = {}
+    discarded: List[int] = []
+    for idx, label in enumerate(labels):
+        if int(label) < 0:
+            discarded.append(idx)
+            continue
+        clusters_dict.setdefault(int(label), []).append(idx)
+
+    clusters = list(clusters_dict.values())
+
+    if clusters:
+        sizes = np.array([len(c) for c in clusters], dtype=np.int32)
+        LOGGER.info(
+            f"HDBSCAN summary: {len(clusters)} clusters, "
+            f"size min={int(sizes.min())}, median={int(np.median(sizes))}, max={int(sizes.max())}."
+        )
+    else:
+        LOGGER.info("HDBSCAN summary: no clusters were produced.")
+
+    if discarded:
+        LOGGER.info(f"HDBSCAN: {len(discarded)} images marked as noise (unclustered).")
+
+    return ClusterResult(clusters=clusters, discarded=discarded)
+
+
+def cluster_by_dbscan(feats: np.ndarray, config: Config, use_gpu: bool) -> ClusterResult:
+    """Cluster embeddings using DBSCAN built on top of FAISS ε-neighborhoods.
+
+    Implementation details:
+    - Uses Config.clustering.threshold as eps (radius), and Config.clustering.min_size as min_samples.
+    - Neighbor sets are computed via FAISS range_search; then DBSCAN expansion uses a queue.
+    - Progress: shows processed points count.
+    """
+    n = int(feats.shape[0])
+    if n == 0:
+        return ClusterResult(clusters=[], discarded=[])
+
+    eps = float(config.clustering.threshold)
+    if eps <= 0.0:
+        LOGGER.error("DBSCAN requires positive threshold (eps). No clusters will be produced.")
+        return ClusterResult(clusters=[], discarded=list(range(n)))
+
+    neighbors = _build_neighbor_sets(feats, eps, use_gpu)
+
+    min_samples = max(1, int(config.clustering.min_size))
+
+    UNVISITED = 0
+    VISITED = 1
+    clustered = -1
+
+    state = np.zeros(n, dtype=np.int8)
+    labels = np.full(n, clustered, dtype=np.int32)
+    current_label = 0
+
+    show_progress = config.misc.log_level == "default"
+    progress = tqdm(total=n, desc="DBSCAN clustering", disable=not show_progress)
+
+    from collections import deque
+
+    for p in range(n):
+        if state[p] != UNVISITED:
+            continue
+        state[p] = VISITED
+        Np = neighbors[p]
+        # sklearn counts self; our neighbor sets exclude self -> use +1
+        if len(Np) + 1 < min_samples:
+            # mark as noise by leaving label as -1 for now
+            if progress:
+                progress.update(1)
+            continue
+        # Create a new cluster
+        labels[p] = current_label
+        queue = deque(Np)
+        while queue:
+            q = queue.popleft()
+            if state[q] == UNVISITED:
+                state[q] = VISITED
+                Nq = neighbors[q]
+                if len(Nq) + 1 >= min_samples:
+                    queue.extend(Nq)
+            if labels[q] == clustered:
+                labels[q] = current_label
+            # We consider a point processed once it receives a label
+        current_label += 1
+        if progress:
+            progress.update(1)
+
+    if progress:
+        # Catch up progress for any unvisited points counted implicitly
+        remaining = n - progress.n
+        if remaining > 0:
+            progress.update(remaining)
+        progress.close()
+
+    clusters_dict: dict = {}
+    discarded: List[int] = []
+    for idx, label in enumerate(labels):
+        if label >= 0:
+            clusters_dict.setdefault(int(label), []).append(idx)
+        else:
+            discarded.append(idx)
+
+    clusters = list(clusters_dict.values())
+
+    if clusters:
+        sizes = np.array([len(c) for c in clusters], dtype=np.int32)
+        LOGGER.info(
+            f"DBSCAN summary: {len(clusters)} clusters, "
+            f"size min={int(sizes.min())}, median={int(np.median(sizes))}, max={int(sizes.max())}."
+        )
+    else:
+        LOGGER.info("DBSCAN summary: no clusters were produced.")
+
+    if discarded:
+        LOGGER.info(f"DBSCAN: {len(discarded)} images marked as noise (unclustered).")
+
+    return ClusterResult(clusters=clusters, discarded=discarded)
+
+
+def cluster_by_graph(feats: np.ndarray, config: Config, use_gpu: bool) -> ClusterResult:
+    """Cluster via connected components on the ε-graph built from FAISS neighbors.
+
+    Implementation details:
+    - Build ε-neighborhoods with threshold.
+    - Symmetrize adjacency to avoid directional artifacts.
+    - Compute connected components via DFS/BFS.
+    - Progress: shown for symmetrization and component discovery.
+    """
+    n = int(feats.shape[0])
+    if n == 0:
+        return ClusterResult(clusters=[], discarded=[])
+
+    eps = float(config.clustering.threshold)
+    if eps <= 0.0:
+        LOGGER.error("Graph clustering requires positive threshold. No clusters will be produced.")
+        return ClusterResult(clusters=[], discarded=list(range(n)))
+
+    neighbors = _build_neighbor_sets(feats, eps, use_gpu)
+
+    # Symmetrize adjacency to form an undirected graph (OR symmetry)
+    show_progress = config.misc.log_level == "default"
+    progress_sym = tqdm(total=n, desc="Symmetrizing graph", disable=not show_progress)
+    adj = [set(s) for s in neighbors]
+    for i in range(n):
+        for j in neighbors[i]:
+            adj[j].add(i)
+        if progress_sym:
+            progress_sym.update(1)
+    if progress_sym:
+        progress_sym.close()
+
+    visited = np.zeros(n, dtype=bool)
+    clusters: List[List[int]] = []
+
+    progress_cc = tqdm(total=n, desc="Graph components", disable=not show_progress)
+    from collections import deque
+    for i in range(n):
+        if visited[i]:
+            continue
+        visited[i] = True
+        comp = []
+        queue = deque([i])
+        while queue:
+            u = queue.popleft()
+            comp.append(u)
+            for v in adj[u]:
+                if not visited[v]:
+                    visited[v] = True
+                    queue.append(v)
+        clusters.append(comp)
+        if progress_cc:
+            progress_cc.update(len(comp))
+    if progress_cc:
+        progress_cc.close()
+
+    # Filter clusters by min_size
+    min_size = int(config.clustering.min_size)
+    valid_clusters: List[List[int]] = []
+    discarded: List[int] = []
+    for comp in clusters:
+        if len(comp) >= min_size:
+            valid_clusters.append(comp)
+        else:
+            discarded.extend(comp)
+
+    if valid_clusters:
+        sizes = np.array([len(c) for c in valid_clusters], dtype=np.int32)
+        LOGGER.info(
+            f"Graph summary: {len(valid_clusters)} clusters, "
+            f"size min={int(sizes.min())}, median={int(np.median(sizes))}, max={int(sizes.max())}."
+        )
+    else:
+        LOGGER.info("Graph summary: no clusters satisfied the minimum size requirement.")
+
+    if discarded:
+        LOGGER.info(f"Graph: {len(discarded)} images that did not meet minimum cluster size.")
+
+    return ClusterResult(clusters=valid_clusters, discarded=discarded)
+
+
+def cluster_by_mutual_graph(feats: np.ndarray, config: Config, use_gpu: bool) -> ClusterResult:
+    """Cluster via connected components on the mutual ε-graph.
+
+    Implementation details:
+    - Build ε-neighborhoods; keep an undirected edge i—j only if i∈N(j) and j∈N(i).
+    - This reduces spurious bridges between clusters compared to plain CC on ε-graph.
+    - Progress bars cover mutual graph construction and component extraction.
+    """
+    n = int(feats.shape[0])
+    if n == 0:
+        return ClusterResult(clusters=[], discarded=[])
+
+    eps = float(config.clustering.threshold)
+    if eps <= 0.0:
+        LOGGER.error("Mutual graph clustering requires positive threshold. No clusters will be produced.")
+        return ClusterResult(clusters=[], discarded=list(range(n)))
+
+    neighbors = _build_neighbor_sets(feats, eps, use_gpu)
+
+    show_progress = config.misc.log_level == "default"
+    progress_build = tqdm(total=n, desc="Building mutual graph", disable=not show_progress)
+
+    # Build mutual adjacency: i—j edge if i in N(j) and j in N(i)
+    adj = [set() for _ in range(n)]
+    for i in range(n):
+        Ni = neighbors[i]
+        for j in Ni:
+            if i in neighbors[j]:
+                adj[i].add(j)
+                adj[j].add(i)
+        if progress_build:
+            progress_build.update(1)
+    if progress_build:
+        progress_build.close()
+
+    visited = np.zeros(n, dtype=bool)
+    clusters: List[List[int]] = []
+
+    progress_cc = tqdm(total=n, desc="Graph components", disable=not show_progress)
+    from collections import deque
+    for i in range(n):
+        if visited[i]:
+            continue
+        visited[i] = True
+        comp = []
+        queue = deque([i])
+        while queue:
+            u = queue.popleft()
+            comp.append(u)
+            for v in adj[u]:
+                if not visited[v]:
+                    visited[v] = True
+                    queue.append(v)
+        clusters.append(comp)
+        if progress_cc:
+            progress_cc.update(len(comp))
+    if progress_cc:
+        progress_cc.close()
+
+    # Filter clusters by min_size
+    min_size = int(config.clustering.min_size)
+    valid_clusters: List[List[int]] = []
+    discarded: List[int] = []
+    for comp in clusters:
+        if len(comp) >= min_size:
+            valid_clusters.append(comp)
+        else:
+            discarded.extend(comp)
+
+    if valid_clusters:
+        sizes = np.array([len(c) for c in valid_clusters], dtype=np.int32)
+        LOGGER.info(
+            f"Mutual graph summary: {len(valid_clusters)} clusters, "
+            f"size min={int(sizes.min())}, median={int(np.median(sizes))}, max={int(sizes.max())}."
+        )
+    else:
+        LOGGER.info("Mutual graph summary: no clusters satisfied the minimum size requirement.")
+
+    if discarded:
+        LOGGER.info(f"Mutual graph: {len(discarded)} images that did not meet minimum cluster size.")
 
     return ClusterResult(clusters=valid_clusters, discarded=discarded)
 
@@ -233,7 +684,10 @@ def export_clusters(
         per_item_avg = None
 
         if compute_distances and len(cluster) > 0:
-            dist_matrix, cluster_avg, per_item_avg = _compute_cluster_distances(cluster_feats)
+            # Use memory-safe computation; limit full matrix creation to manageable cluster sizes.
+            limit = int(getattr(config.clustering, "pairwise_limit", 1200))
+            chunk = int(getattr(config.clustering, "distance_chunk_size", 1024))
+            dist_matrix, cluster_avg, per_item_avg = _compute_cluster_distances(cluster_feats, limit, chunk)
         elif len(cluster) == 0:
             dist_matrix = np.zeros((0, 0), dtype=np.float32)
             cluster_avg = 0.0
@@ -336,6 +790,7 @@ def export_clusters(
 
     if save_mode == "default":
         summary = {
+            "algorithm": getattr(config.clustering, "algorithm", "distance"),
             "threshold": config.clustering.threshold,
             "similarity_percent": config.clustering.similarity_percent,
             "min_cluster_size": config.clustering.min_size,
@@ -344,6 +799,12 @@ def export_clusters(
             "discarded_count": len(result.discarded),
             "clusters": clusters_summary,
             "discarded_paths": [paths[item] for item in result.discarded],
+            "pca": {
+                "enabled": bool(getattr(config.clustering, "pca_enabled", False)),
+                "requested_components": int(getattr(config.clustering, "pca_components", 0)),
+                "effective_components": int(getattr(config.clustering, "_pca_effective_components", getattr(config.clustering, "pca_components", 0))) if getattr(config.clustering, "pca_enabled", False) else None,
+                "whiten": bool(getattr(config.clustering, "pca_whiten", True)),
+            },
         }
         summary_path = os.path.join(base_dir, "clusters.json")
         with open(summary_path, "w", encoding="utf-8") as handle:
@@ -356,6 +817,13 @@ def export_clusters(
     elif save_mode == "json":
         files_section = {path: file_id for path, file_id in sorted(file_id_map.items(), key=lambda item: item[1])}
         payload = {
+            "algorithm": getattr(config.clustering, "algorithm", "distance"),
+            "pca": {
+                "enabled": bool(getattr(config.clustering, "pca_enabled", False)),
+                "requested_components": int(getattr(config.clustering, "pca_components", 0)),
+                "effective_components": int(getattr(config.clustering, "_pca_effective_components", getattr(config.clustering, "pca_components", 0))) if getattr(config.clustering, "pca_enabled", False) else None,
+                "whiten": bool(getattr(config.clustering, "pca_whiten", True)),
+            },
             "files": files_section,
             "clusters": alt_clusters,
         }

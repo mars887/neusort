@@ -173,14 +173,20 @@ PROGRAMM_ARGS = {
         "choices": ["default", "json", "print"],
         "help": "How to store clustering results: 'default' folders, 'json' file only, or 'print' to console."
     },
+    "--cluster_algorithm": {
+        "type": str,
+        "default": "distance",
+        "choices": ["distance", "dbscan", "hdbscan", "cc_graph", "mutual_graph", "graph"],
+        "help": "Clustering algorithm: 'distance' (greedy overlap), 'dbscan' (density), 'hdbscan' (hierarchical density), 'cc_graph' (ε-graph connected components), or 'mutual_graph' (mutual ε-neighbors). 'graph' is kept as alias for 'cc_graph'."
+    },
     "--threshold": {
         "type": float,
-        "default": 0.35,
+        "default": 0.25,
         "help": "Maximum distance between images to consider them similar for clustering."
     },
     "--similarity_percent": {
         "type": float,
-        "default": 50.0,
+        "default": 60.0,
         "help": "Percentage of existing cluster images that must be within threshold for a new image to join."
     },
     "--cluster_min_size": {
@@ -193,6 +199,21 @@ PROGRAMM_ARGS = {
         "default": "default",
         "choices": ["default", "distance", "distance_plus"],
         "help": "Controls how cluster folders and files are named: default numbering or distance-based variants."
+    },
+    "--cluster_pca": {
+        "action": "store_true",
+        "help": "Enable PCA pre-processing before clustering (dimensionality reduction + whitening)."
+    },
+    "--cluster_pca_components": {
+        "type": int,
+        "default": 256,
+        "help": "Number of PCA components to keep (reduced dimension). Will be clipped to [1, min(n-1, D)]."
+    },
+    "--cluster_pca_whiten": {
+        "type": str,
+        "default": "true",
+        "metavar": "BOOL",
+        "help": "Whether to whiten PCA components (true/false). Whitening approximates Mahalanobis distance."
     },
 
 
@@ -219,6 +240,11 @@ GROUPED_ARGUMENT_SPECS = {
             "mode": {"arg": "--cluster_naming_mode"},
             "save_discarded": {"arg": "--save_discarded"},
             "save_mode": {"arg": "--save_mode"},
+            "algorithm": {"arg": "--cluster_algorithm"},
+            "cluster_algorithm": {"arg": "--cluster_algorithm"},
+            "pca": {"arg": "--cluster_pca", "type": "bool"},
+            "pca_components": {"arg": "--cluster_pca_components"},
+            "pca_whiten": {"arg": "--cluster_pca_whiten"},
         },
     },
     "model": {

@@ -62,16 +62,16 @@ class Config:
             def __init__(self, args):
                 self.enabled = bool(getattr(args, "cluster", False))
                 # Algorithm selection for clustering. Supported: 'distance' (existing method), 'hdbscan'.
-                algo = str(getattr(args, "cluster_algorithm", "distance")).lower()
+                algo = str(getattr(args, "algorithm", "distance")).lower()
                 # Accept legacy alias 'graph' by mapping to 'cc_graph'.
                 if algo == "graph":
                     algo = "cc_graph"
                 if algo not in {"distance", "hdbscan", "dbscan", "cc_graph", "mutual_graph"}:
                     algo = "distance"
                 self.algorithm = algo
-                threshold = float(getattr(args, "threshold", 0.35))
+                threshold = float(getattr(args, "cluster_threshold", 0.35))
                 self.threshold = threshold if threshold >= 0.0 else 0.0
-                percent = float(getattr(args, "similarity_percent", 50.0))
+                percent = float(getattr(args, "cluster_similarity_percent", 50.0))
                 percent = max(0.0, min(100.0, percent))
                 self.similarity_percent = percent
                 self.similarity_ratio = percent / 100.0
@@ -103,9 +103,9 @@ class Config:
 
                 # PCA/whitening pre-processing
                 self.pca_enabled = bool(getattr(args, "cluster_pca", False))
-                comp = int(getattr(args, "cluster_pca_components", 256))
+                comp = int(getattr(args, "pca_components", 256))
                 self.pca_components = max(1, comp)
-                raw_pca_whiten = getattr(args, "cluster_pca_whiten", "true")
+                raw_pca_whiten = getattr(args, "pca_whiten", "true")
                 if isinstance(raw_pca_whiten, bool):
                     pca_whiten = raw_pca_whiten
                 elif isinstance(raw_pca_whiten, str):

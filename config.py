@@ -83,7 +83,7 @@ class Config:
                 self.naming_mode = naming_mode
                 raw_save_mode = getattr(args, "save_mode", "default")
                 save_mode = str(raw_save_mode).lower()
-                if save_mode not in {"default", "json", "print"}:
+                if save_mode not in {"default", "json", "print", "group_filling"}:
                     save_mode = "default"
                 self.save_mode = save_mode
                 raw_discarded = getattr(args, "save_discarded", "true")
@@ -100,6 +100,14 @@ class Config:
                 else:
                     save_discarded = bool(raw_discarded)
                 self.save_discarded = save_discarded
+
+                # Group-filling parameters (for save_mode=group_filling)
+                gsz = int(getattr(args, "group_filling_size", 10) or 10)
+                self.group_filling_size = max(1, gsz)
+                split_mode = str(getattr(args, "cluster_splitting_mode", "recluster") or "recluster").lower()
+                if split_mode not in {"recluster", "fi"}:  # 'fi' = farthest_insertion_path
+                    split_mode = "recluster"
+                self.cluster_splitting_mode = split_mode
 
                 # PCA/whitening pre-processing
                 self.pca_enabled = bool(getattr(args, "cluster_pca", False))

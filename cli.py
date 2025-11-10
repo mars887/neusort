@@ -27,6 +27,8 @@ CLI_SPEC: List[Dict[str, Any]] = [
             "save_mode": {"names": ["save_mode"], "type": "str", "dest": "save_mode"},
             "algorithm": {"names": ["algorithm", "cluster_algorithm"], "type": "str", "dest": "algorithm"},
             "cluster_pca": {"names": ["pca", "cluster_pca"], "type": "bool", "dest": "cluster_pca"},
+            "group_filling_size": {"names": ["group_filling_size", "group_size", "x"], "type": "int", "dest": "group_filling_size"},
+            "cluster_splitting_mode": {"names": ["cluster_splitting_mode", "split_mode"], "type": "str", "dest": "cluster_splitting_mode"},
         },
     },
     {

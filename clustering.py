@@ -16,6 +16,7 @@ from tqdm.auto import tqdm
 from cli import LOGGER
 from config import Config
 from utils import copy_and_rename
+from sorting import farthest_insertion_path
 
 
 @dataclass
@@ -654,7 +655,7 @@ def export_clusters(
     """Persist cluster results to disk and return summary stats."""
     base_dir = config.files.dst_folder
     save_mode = str(getattr(config.clustering, "save_mode", "default")).lower()
-    if save_mode not in {"default", "json", "print"}:
+    if save_mode not in {"default", "json", "print", "group_filling"}:
         save_mode = "default"
     raw_discard_flag = getattr(config.clustering, "save_discarded", True)
     if isinstance(raw_discard_flag, str):
@@ -663,8 +664,206 @@ def export_clusters(
     else:
         save_discarded = bool(raw_discard_flag)
 
-    if save_mode in {"default", "json"}:
+    if save_mode in {"default", "json", "group_filling"}:
         os.makedirs(base_dir, exist_ok=True)
+
+    # Special mode: flatten clusters into fixed-size groups with filling by discarded
+    if save_mode == "group_filling":
+        group_size = int(getattr(config.clustering, "group_filling_size", 10) or 10)
+        if group_size <= 0:
+            group_size = 10
+        split_mode = str(getattr(config.clustering, "cluster_splitting_mode", "recluster") or "recluster").lower()
+        if split_mode not in {"recluster", "fi"}:
+            split_mode = "recluster"
+
+        # Helpers for splitting large clusters
+        def _split_cluster_by_fi(cluster: List[int]) -> List[List[int]]:
+            if len(cluster) <= group_size:
+                return [cluster]
+            sub_feats = feats[cluster]
+            local_order = farthest_insertion_path(sub_feats, config)
+            mapped = [cluster[int(i)] for i in local_order]
+            chunks: List[List[int]] = []
+            for s in range(0, len(mapped), group_size):
+                chunks.append(mapped[s:s + group_size])
+            return chunks
+
+        def _split_cluster_by_recluster(cluster: List[int]) -> List[List[int]]:
+            if len(cluster) <= group_size:
+                return [cluster]
+
+            # Binary search on threshold to enforce max size <= group_size
+            base_thr = float(getattr(config.clustering, "threshold", 0.35) or 0.35)
+            if base_thr <= 0:
+                return _split_cluster_by_fi(cluster)
+            lo = max(1e-6, base_thr * 1e-4)
+            hi = base_thr
+            best: List[List[int]] = []
+            found = False
+
+            # Save original settings to restore after temporary modifications
+            orig_thr = float(config.clustering.threshold)
+            orig_min = int(config.clustering.min_size)
+            try:
+                # Always allow singletons inside re-cluster step
+                for _ in range(14):
+                    mid = 0.5 * (lo + hi)
+                    config.clustering.threshold = mid
+                    config.clustering.min_size = 1
+                    sub_feats = feats[cluster]
+                    sub_res = cluster_by_distance(sub_feats, config, use_gpu=False)
+                    # Map back to original indices; no discards expected (min_size=1)
+                    sub_clusters = [[cluster[i] for i in part] for part in sub_res.clusters]
+                    max_size = max((len(c) for c in sub_clusters), default=0)
+                    if max_size <= group_size and len(sub_clusters) > 0:
+                        found = True
+                        best = sub_clusters
+                        # try to loosen a bit to reduce fragmentation
+                        lo = mid
+                    else:
+                        hi = mid
+                    if hi - lo <= base_thr * 1e-4:
+                        break
+            except Exception:
+                # Fallback to FI if anything goes wrong
+                best = []
+                found = False
+            finally:
+                config.clustering.threshold = orig_thr
+                config.clustering.min_size = orig_min
+
+            if not found or not best:
+                return _split_cluster_by_fi(cluster)
+
+            # Ensure resulting parts are chunked by group_size if any part still exceeds (safety)
+            out: List[List[int]] = []
+            for part in best:
+                if len(part) <= group_size:
+                    out.append(part)
+                else:
+                    for s in range(0, len(part), group_size):
+                        out.append(part[s:s + group_size])
+            return out
+
+        # 1) Prepare clusters: split large ones per chosen mode
+        prepared: List[List[int]] = []
+        for cl in result.clusters:
+            if len(cl) <= group_size:
+                prepared.append(list(cl))
+            else:
+                if split_mode == "fi":
+                    prepared.extend(_split_cluster_by_fi(list(cl)))
+                else:  # recluster
+                    prepared.extend(_split_cluster_by_recluster(list(cl)))
+
+        # Stats: prepared clusters
+        if prepared:
+            sizes = np.array([len(c) for c in prepared], dtype=np.int32)
+            LOGGER.debug(
+                f"[group_filling] prepared_clusters={len(prepared)} size_min={int(sizes.min())} "
+                f"median={int(np.median(sizes))} max={int(sizes.max())}"
+            )
+        else:
+            LOGGER.debug("[group_filling] no clusters after preparation (all discarded or empty input)")
+
+        from collections import deque
+        all_discards = list(result.discarded if save_discarded else [])
+
+        def build_cluster_groups(clusters: List[List[int]], by_size_desc: bool) -> List[List[int]]:
+            items = list(clusters)
+            if by_size_desc:
+                items = sorted(items, key=lambda c: len(c), reverse=True)
+            groups: List[List[int]] = []
+            current: List[List[int]] = []  # store clusters for the current group (list of lists)
+            used_cap = 0
+            if not by_size_desc:
+                # original order, sequential pack
+                idx = 0
+                while idx < len(items):
+                    if used_cap + len(items[idx]) <= group_size:
+                        current.append(items[idx])
+                        used_cap += len(items[idx])
+                        idx += 1
+                    else:
+                        groups.append([x for part in current for x in part])
+                        current = []
+                        used_cap = 0
+                if current:
+                    groups.append([x for part in current for x in part])
+            else:
+                # first-fit decreasing bin pack by cluster size
+                bins: List[Tuple[int, List[List[int]]]] = []  # (used_cap, [clusters])
+                for cl in items:
+                    placed = False
+                    for bi in range(len(bins)):
+                        cap, arr = bins[bi]
+                        if cap + len(cl) <= group_size:
+                            arr.append(cl)
+                            bins[bi] = (cap + len(cl), arr)
+                            placed = True
+                            break
+                    if not placed:
+                        bins.append((len(cl), [cl]))
+                for cap, arr in bins:
+                    groups.append([x for part in arr for x in part])
+            return groups
+
+        def fill_groups_with_discards(groups_cluster_only: List[List[int]], discards: List[int]) -> Tuple[List[int], int, int, int]:
+            dq = deque(discards)
+            seq: List[int] = []
+            disc_used = 0
+            groups_filled = 0
+            groups_incomplete = 0
+            for g in groups_cluster_only:
+                seq.extend(g)
+                gap = max(0, group_size - len(g))
+                if gap > 0:
+                    groups_filled += 1
+                used_here = 0
+                while gap > 0 and dq:
+                    seq.append(int(dq.popleft()))
+                    disc_used += 1
+                    used_here += 1
+                    gap -= 1
+                if gap > 0:
+                    groups_incomplete += 1
+            # append remaining discards at the end
+            if dq:
+                seq.extend(list(dq))
+            return seq, disc_used, groups_filled, groups_incomplete
+
+        # Phase 1: original-order greedy packing
+        groups_seq_order = build_cluster_groups(prepared, by_size_desc=False)
+        holes_total = sum(max(0, group_size - len(g)) for g in groups_seq_order)
+        need_repack = len(all_discards) < holes_total and len(prepared) > 0
+        LOGGER.debug(
+            f"[group_filling] phase1 groups={len(groups_seq_order)} holes={holes_total} "
+            f"discards_avail={len(all_discards)} repack={'yes' if need_repack else 'no'}"
+        )
+
+        if need_repack:
+            # Phase 2: FFD repack to reduce holes
+            groups_ffd = build_cluster_groups(prepared, by_size_desc=True)
+            holes_ffd = sum(max(0, group_size - len(g)) for g in groups_ffd)
+            LOGGER.debug(
+                f"[group_filling] phase2 FFD groups={len(groups_ffd)} holes={holes_ffd} (improved={holes_ffd < holes_total})"
+            )
+            target_groups = groups_ffd
+        else:
+            target_groups = groups_seq_order
+
+        sequence, disc_used, groups_filled, groups_incomplete = fill_groups_with_discards(target_groups, all_discards)
+        LOGGER.debug(
+            f"[group_filling] filled_groups={groups_filled} groups_incomplete={groups_incomplete} discards_used={disc_used}"
+        )
+
+        # Save in the computed order
+        if not config.misc.list_only:
+            copy_and_rename(paths, sequence, base_dir, config)
+        LOGGER.info(
+            f"Group-filling output saved to: {base_dir} (groups of {group_size}, split={split_mode})."
+        )
+        return base_dir, len(result.clusters), len(result.discarded)
 
     naming_mode = getattr(config.clustering, "naming_mode", "default")
     # JSON/print modes require distance statistics even if the naming mode would not.

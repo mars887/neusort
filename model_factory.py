@@ -297,3 +297,24 @@ def create_torchvision_model(model_name, cfg):
     target_module.register_forward_hook(hook_fn)
 
     return model, hook_blob
+
+
+"""
+"mobilenet_v3_small": "small MobileNetV3 model for CPU / low-memory GPU...",
+"mobilenet_v3_large": "large MobileNetV3 model for better accuracy, still fast...",
+"convnext_small": "ConvNeXt small model, good balance of speed and accuracy.",
+"regnet_y_400mf": "RegNetY 400MF, very fast, low accuracy.",
+"regnet_y_800mf": "RegNetY 800MF, fast, moderate accuracy.",
+"regnet_y_1_6gf": "RegNetY 1.6GF, balanced speed and accuracy.",
+"regnet_y_3_2gf": "RegNetY 3.2GF, good accuracy, moderate speed.",
+"regnet_y_8gf": "RegNetY 8GF, high accuracy, slower.",
+"regnet_y_16gf": "RegNetY 16GF, very high accuracy, needs more memory.",        
+"regnet_y_32gf": "RegNetY 32GF, extremely high accuracy, high memory usage.",
+"regnet_y_128gf": "RegNetY 128GF, state-of-the-art, very high memory usage.",
+"clip_vit_large": "OpenAI CLIP ViT-Large (ViT-L/14), 336px, good accuracy, needs more memory.",
+"clip_vit_liaon": "LAION CLIP ViT-Huge (ViT-H/14), excellent accuracy.",
+"efficientnet_v2_s": "EfficientNetV2 Small, good balance.",
+"efficientnet_v2_m": "EfficientNetV2 Medium, better accuracy.",
+"efficientnet_v2_l": "EfficientNetV2 Large, high accuracy.",
+"clip_vit_liaon_mega": "LAION CLIP ViT-bigG (ViT-bigG/14), best accuracy, highest memory usage."
+"""

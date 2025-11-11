@@ -17,16 +17,20 @@ def copy_and_rename(paths, order, out_folder,config: Config):
     num_digits = len(str(total_files - 1)) if total_files > 0 else 1 
     fmt = f"{{:0{num_digits}d}}"
 
-    if config.misc.log_level == "default":
-        pbar = tqdm(total=total_files, desc=f"Копирование в '{out_folder}'")
-        for new_i, old_i in enumerate(order):
-            src = paths[old_i]
-            ext = os.path.splitext(src)[1].lower()
-            original_name = os.path.splitext(os.path.basename(src))[0]
-            # Формат имени: 0000_original_name.ext для удобной сортировки
-            dst = os.path.join(out_folder, f"{fmt.format(new_i)}_{original_name}{ext}")
-            shutil.copy2(src, dst)
+    show_progress = (str(getattr(config.misc, "log_level", "default")).lower() == "default")
+    pbar = tqdm(total=total_files, desc=f"Копирование в '{out_folder}'") if show_progress else None
+
+    for new_i, old_i in enumerate(order):
+        src = paths[old_i]
+        ext = os.path.splitext(src)[1].lower()
+        original_name = os.path.splitext(os.path.basename(src))[0]
+        # Формат имени: 0000_original_name.ext для удобной сортировки
+        dst = os.path.join(out_folder, f"{fmt.format(new_i)}_{original_name}{ext}")
+        shutil.copy2(src, dst)
+        if pbar is not None:
             pbar.update(1)
+
+    if pbar is not None:
         pbar.close()
 
     LOGGER.info(f"Копирование завершено.")

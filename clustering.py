@@ -2,8 +2,9 @@ import json
 import math
 import os
 import shutil
+from collections import deque
 from dataclasses import dataclass
-from typing import List, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import faiss
 try:
@@ -646,6 +647,654 @@ def cluster_by_mutual_graph(feats: np.ndarray, config: Config, use_gpu: bool) ->
     return ClusterResult(clusters=valid_clusters, discarded=discarded)
 
 
+def _resolve_save_mode(config: Config) -> str:
+    raw_mode = str(getattr(config.clustering, "save_mode", "default")).lower()
+    if raw_mode not in {"default", "json", "print", "group_filling"}:
+        return "default"
+    return raw_mode
+
+
+def _resolve_save_discarded(config: Config) -> bool:
+    raw_flag = getattr(config.clustering, "save_discarded", True)
+    if isinstance(raw_flag, str):
+        lowered = raw_flag.strip().lower()
+        return lowered not in {"0", "false", "no", "off"}
+    return bool(raw_flag)
+
+
+def _export_group_filling(
+    paths: Sequence[str],
+    feats: np.ndarray,
+    result: ClusterResult,
+    config: Config,
+    base_dir: str,
+    save_discarded: bool,
+) -> Tuple[str, int, int]:
+    """Handle save_mode=group_filling."""
+    group_size = int(getattr(config.clustering, "group_filling_size", 10) or 10)
+    if group_size <= 0:
+        group_size = 10
+    split_mode = str(getattr(config.clustering, "cluster_splitting_mode", "recluster") or "recluster").lower()
+    if split_mode not in {"recluster", "fi"}:
+        split_mode = "recluster"
+
+    prepared = _prepare_group_filling_clusters(result.clusters, feats, config, group_size, split_mode)
+
+    all_discards = list(result.discarded if save_discarded else [])
+    groups_seq_order = _build_cluster_groups(prepared, group_size, by_size_desc=False)
+    holes_total = sum(max(0, group_size - len(g)) for g in groups_seq_order)
+    need_repack = len(all_discards) < holes_total and len(prepared) > 0
+    LOGGER.debug(
+        f"[group_filling] phase1 groups={len(groups_seq_order)} holes={holes_total} "
+        f"discards_avail={len(all_discards)} repack={'yes' if need_repack else 'no'}"
+    )
+
+    if need_repack:
+        groups_ffd = _build_cluster_groups(prepared, group_size, by_size_desc=True)
+        holes_ffd = sum(max(0, group_size - len(g)) for g in groups_ffd)
+        LOGGER.debug(
+            f"[group_filling] phase2 FFD groups={len(groups_ffd)} holes={holes_ffd} (improved={holes_ffd < holes_total})"
+        )
+        target_groups = groups_ffd
+    else:
+        target_groups = groups_seq_order
+
+    use_similar = bool(getattr(config.clustering, "similar_fill", False))
+    if use_similar:
+        LOGGER.debug("[group_filling] similar_fill=true (centroid-based)")
+    sequence, disc_used, groups_filled, groups_incomplete = _fill_groups_with_discards(
+        target_groups, all_discards, group_size, feats, use_similar
+    )
+    LOGGER.debug(
+        f"[group_filling] filled_groups={groups_filled} groups_incomplete={groups_incomplete} discards_used={disc_used}"
+    )
+
+    if not config.misc.list_only:
+        _save_group_sequence(paths, result, sequence, base_dir, config, group_size, split_mode)
+
+    return base_dir, len(result.clusters), len(result.discarded)
+
+
+def _prepare_group_filling_clusters(
+    clusters: Sequence[Sequence[int]],
+    feats: np.ndarray,
+    config: Config,
+    group_size: int,
+    split_mode: str,
+) -> List[List[int]]:
+    prepared: List[List[int]] = []
+    for cl in clusters:
+        current = list(cl)
+        if len(current) <= group_size:
+            prepared.append(current)
+        elif split_mode == "fi":
+            prepared.extend(_split_cluster_by_fi(current, feats, config, group_size))
+        else:
+            prepared.extend(_split_cluster_by_recluster(current, feats, config, group_size))
+
+    if prepared:
+        sizes = np.array([len(c) for c in prepared], dtype=np.int32)
+        LOGGER.debug(
+            f"[group_filling] prepared_clusters={len(prepared)} size_min={int(sizes.min())} "
+            f"median={int(np.median(sizes))} max={int(sizes.max())}"
+        )
+    else:
+        LOGGER.debug("[group_filling] no clusters after preparation (all discarded or empty input)")
+
+    return prepared
+
+
+def _split_cluster_by_fi(
+    cluster: List[int],
+    feats: np.ndarray,
+    config: Config,
+    group_size: int,
+) -> List[List[int]]:
+    if len(cluster) <= group_size:
+        return [list(cluster)]
+    sub_feats = feats[cluster]
+    local_order = farthest_insertion_path(sub_feats, config)
+    mapped = [cluster[int(i)] for i in local_order]
+    return [mapped[s : s + group_size] for s in range(0, len(mapped), group_size)]
+
+
+def _split_cluster_by_recluster(
+    cluster: List[int],
+    feats: np.ndarray,
+    config: Config,
+    group_size: int,
+) -> List[List[int]]:
+    if len(cluster) <= group_size:
+        return [list(cluster)]
+
+    base_thr = float(getattr(config.clustering, "threshold", 0.35) or 0.35)
+    if base_thr <= 0:
+        return _split_cluster_by_fi(cluster, feats, config, group_size)
+    lo = max(1e-6, base_thr * 1e-4)
+    hi = base_thr
+    best: List[List[int]] = []
+    found = False
+
+    orig_thr = float(config.clustering.threshold)
+    orig_min = int(config.clustering.min_size)
+    try:
+        for _ in range(14):
+            mid = 0.5 * (lo + hi)
+            config.clustering.threshold = mid
+            config.clustering.min_size = 1
+            sub_feats = feats[cluster]
+            sub_res = cluster_by_distance(sub_feats, config, use_gpu=False)
+            sub_clusters = [[cluster[i] for i in part] for part in sub_res.clusters]
+            max_size = max((len(c) for c in sub_clusters), default=0)
+            if max_size <= group_size and len(sub_clusters) > 0:
+                found = True
+                best = sub_clusters
+                lo = mid
+            else:
+                hi = mid
+            if hi - lo <= base_thr * 1e-4:
+                break
+    except Exception:
+        best = []
+        found = False
+    finally:
+        config.clustering.threshold = orig_thr
+        config.clustering.min_size = orig_min
+
+    if not found or not best:
+        return _split_cluster_by_fi(cluster, feats, config, group_size)
+
+    out: List[List[int]] = []
+    for part in best:
+        if len(part) <= group_size:
+            out.append(part)
+        else:
+            for s in range(0, len(part), group_size):
+                out.append(part[s : s + group_size])
+    return out
+
+
+def _build_cluster_groups(clusters: List[List[int]], group_size: int, by_size_desc: bool) -> List[List[int]]:
+    items = list(clusters)
+    if by_size_desc:
+        items = sorted(items, key=lambda c: len(c), reverse=True)
+    groups: List[List[int]] = []
+    current: List[List[int]] = []
+    used_cap = 0
+    if not by_size_desc:
+        idx = 0
+        while idx < len(items):
+            if used_cap + len(items[idx]) <= group_size:
+                current.append(items[idx])
+                used_cap += len(items[idx])
+                idx += 1
+            else:
+                groups.append([x for part in current for x in part])
+                current = []
+                used_cap = 0
+        if current:
+            groups.append([x for part in current for x in part])
+    else:
+        bins: List[Tuple[int, List[List[int]]]] = []
+        for cl in items:
+            placed = False
+            for bi in range(len(bins)):
+                cap, arr = bins[bi]
+                if cap + len(cl) <= group_size:
+                    arr.append(cl)
+                    bins[bi] = (cap + len(cl), arr)
+                    placed = True
+                    break
+            if not placed:
+                bins.append((len(cl), [cl]))
+        for _, arr in bins:
+            groups.append([x for part in arr for x in part])
+    return groups
+
+
+def _fill_groups_with_discards(
+    groups_cluster_only: List[List[int]],
+    discards: List[int],
+    group_size: int,
+    feats: np.ndarray,
+    use_similar: bool,
+) -> Tuple[List[int], int, int, int]:
+    seq: List[int] = []
+    disc_used = 0
+    groups_filled = 0
+    groups_incomplete = 0
+
+    if not use_similar:
+        dq = deque(discards)
+        for g in groups_cluster_only:
+            seq.extend(g)
+            gap = max(0, group_size - len(g))
+            if gap > 0:
+                groups_filled += 1
+            while gap > 0 and dq:
+                seq.append(int(dq.popleft()))
+                disc_used += 1
+                gap -= 1
+            if gap > 0:
+                groups_incomplete += 1
+        if dq:
+            seq.extend(list(dq))
+        return seq, disc_used, groups_filled, groups_incomplete
+
+    # Similar-fill: for each group, pick nearest discards to group centroid
+    avail: List[int] = list(discards)
+    for g in groups_cluster_only:
+        seq.extend(g)
+        gap = max(0, group_size - len(g))
+        if gap > 0:
+            groups_filled += 1
+        if gap > 0 and len(avail) > 0 and len(g) > 0:
+            k = min(gap, len(avail))
+            g_feats = feats[np.array(g, dtype=int)]
+            centroid = np.mean(g_feats.astype(np.float32, copy=False), axis=0)
+            A = feats[np.array(avail, dtype=int)].astype(np.float32, copy=False)
+            dif = A - centroid
+            d2 = np.einsum('ij,ij->i', dif, dif)
+            pos = np.argpartition(d2, k - 1)[:k]
+            pos_sorted = pos[np.argsort(d2[pos])]
+            chosen = [avail[int(p)] for p in pos_sorted]
+            seq.extend(int(x) for x in chosen)
+            disc_used += len(chosen)
+            # remove chosen by index positions within avail
+            remove_set = set(int(p) for p in pos_sorted)
+            avail = [x for i, x in enumerate(avail) if i not in remove_set]
+            gap -= len(chosen)
+        if gap > 0:
+            groups_incomplete += 1
+    if len(avail) > 0:
+        seq.extend(avail)
+    return seq, disc_used, groups_filled, groups_incomplete
+
+
+def _save_group_sequence(
+    paths: Sequence[str],
+    result: ClusterResult,
+    sequence: List[int],
+    base_dir: str,
+    config: Config,
+    group_size: int,
+    split_mode: str,
+) -> None:
+    cluster_id_map = {}
+    for cid, cl in enumerate(result.clusters, start=1):
+        for idx0 in cl:
+            cluster_id_map[int(idx0)] = int(cid)
+
+    total_files = len(sequence)
+    num_digits = len(str(total_files - 1)) if total_files > 0 else 1
+    fmt = f"{{:0{num_digits}d}}"
+    custom_names: List[str] = []
+    for new_pos, orig_idx in enumerate(sequence):
+        src = paths[orig_idx]
+        ext = os.path.splitext(src)[1].lower()
+        original_name = os.path.splitext(os.path.basename(src))[0]
+        cluster_id = int(cluster_id_map.get(int(orig_idx), 0))
+        custom_names.append(f"{fmt.format(new_pos)}_{cluster_id}_{original_name}{ext}")
+
+    _copy_with_custom_names(paths, sequence, custom_names, base_dir, config)
+    LOGGER.info(f"Group-filling output saved to: {base_dir} (groups of {group_size}, split={split_mode}).")
+
+
+def _build_cluster_payloads(
+    paths: Sequence[str],
+    feats: np.ndarray,
+    result: ClusterResult,
+    config: Config,
+    base_dir: str,
+    save_mode: str,
+    naming_mode: str,
+    compute_distances: bool,
+) -> Tuple[List[dict], List[dict], Dict[str, int]]:
+    clusters_summary: List[dict] = []
+    need_alt_output = save_mode in {"json", "print"}
+    alt_clusters: List[dict] = []
+    file_id_map: Dict[str, int] = {} if need_alt_output else {}
+
+    for idx, cluster in enumerate(result.clusters, start=1):
+        summary_entry, alt_entry = _process_single_cluster(
+            idx,
+            cluster,
+            paths,
+            feats,
+            config,
+            base_dir,
+            save_mode,
+            naming_mode,
+            compute_distances,
+            need_alt_output,
+            file_id_map,
+        )
+        clusters_summary.append(summary_entry)
+        if alt_entry is not None:
+            alt_clusters.append(alt_entry)
+
+    return clusters_summary, alt_clusters, file_id_map
+
+
+def _process_single_cluster(
+    idx: int,
+    cluster: List[int],
+    paths: Sequence[str],
+    feats: np.ndarray,
+    config: Config,
+    base_dir: str,
+    save_mode: str,
+    naming_mode: str,
+    compute_distances: bool,
+    need_alt_output: bool,
+    file_id_map: Dict[str, int],
+) -> Tuple[dict, Optional[dict]]:
+    cluster_paths = [paths[item] for item in cluster]
+    cluster_feats = feats[cluster] if cluster else np.empty((0, feats.shape[1]), dtype=feats.dtype)
+    dist_matrix, cluster_avg, per_item_avg = _compute_cluster_stats(cluster_feats, compute_distances, len(cluster), config)
+
+    folder_name = f"cluster_{idx:03d}"
+    if naming_mode in {"distance", "distance_plus"} and cluster_avg is not None:
+        folder_name = f"{idx:03d}-{_format_distance(cluster_avg)}"
+
+    cluster_dir = os.path.join(base_dir, folder_name)
+    distance_names: List[str] = []
+    if naming_mode in {"distance", "distance_plus"} and per_item_avg is not None and len(cluster) > 0:
+        distance_names = _build_distance_based_names(paths, cluster, per_item_avg)
+    saved_names = _save_cluster_files(
+        save_mode,
+        config.misc.list_only,
+        distance_names,
+        cluster_dir,
+        cluster,
+        paths,
+        config,
+        naming_mode,
+        dist_matrix,
+    )
+
+    cluster_entry = {
+        "id": idx,
+        "size": len(cluster),
+        "folder_name": folder_name,
+        "paths": cluster_paths,
+    }
+    if cluster_avg is not None:
+        cluster_entry["average_distance"] = float(cluster_avg)
+
+    items = []
+    for local_idx, original_idx in enumerate(cluster):
+        item_info = {"path": paths[original_idx]}
+        if per_item_avg is not None and local_idx < len(per_item_avg):
+            item_info["average_distance"] = float(per_item_avg[local_idx])
+        if saved_names and local_idx < len(saved_names):
+            item_info["file_name"] = saved_names[local_idx]
+        items.append(item_info)
+    cluster_entry["items"] = items
+
+    if (
+        naming_mode == "distance_plus"
+        and save_mode == "default"
+        and not config.misc.list_only
+        and len(cluster_paths) > 0
+    ):
+        cluster_entry["pairwise_json"] = os.path.join(folder_name, "cluster_distances.json")
+
+    alt_entry = _build_alt_cluster_entry(
+        idx,
+        cluster,
+        paths,
+        per_item_avg,
+        saved_names,
+        need_alt_output,
+        file_id_map,
+        cluster_avg,
+        naming_mode,
+        dist_matrix,
+    )
+    return cluster_entry, alt_entry
+
+
+def _compute_cluster_stats(
+    cluster_feats: np.ndarray,
+    compute_distances: bool,
+    cluster_size: int,
+    config: Config,
+) -> Tuple[Optional[np.ndarray], Optional[float], Optional[np.ndarray]]:
+    dist_matrix: Optional[np.ndarray] = None
+    cluster_avg: Optional[float] = None
+    per_item_avg: Optional[np.ndarray] = None
+
+    if compute_distances and cluster_size > 0:
+        limit = int(getattr(config.clustering, "pairwise_limit", 1200))
+        chunk = int(getattr(config.clustering, "distance_chunk_size", 1024))
+        dist_matrix, cluster_avg, per_item_avg = _compute_cluster_distances(cluster_feats, limit, chunk)
+    elif cluster_size == 0:
+        dist_matrix = np.zeros((0, 0), dtype=np.float32)
+        cluster_avg = 0.0
+        per_item_avg = np.zeros((0,), dtype=np.float32)
+
+    return dist_matrix, cluster_avg, per_item_avg
+
+
+def _save_cluster_files(
+    save_mode: str,
+    list_only: bool,
+    distance_names: List[str],
+    cluster_dir: str,
+    cluster: List[int],
+    paths: Sequence[str],
+    config: Config,
+    naming_mode: str,
+    dist_matrix: Optional[np.ndarray],
+) -> List[str]:
+    if save_mode != "default":
+        return list(distance_names) if distance_names and list_only else []
+
+    if list_only:
+        return list(distance_names) if distance_names else []
+
+    if distance_names:
+        _copy_with_custom_names(paths, cluster, distance_names, cluster_dir, config)
+        if naming_mode == "distance_plus" and dist_matrix is not None and dist_matrix.size > 0:
+            _write_pairwise_json(cluster_dir, dist_matrix)
+        return list(distance_names)
+
+    copy_and_rename(paths, cluster, cluster_dir, config)
+    return []
+
+
+def _build_alt_cluster_entry(
+    idx: int,
+    cluster: List[int],
+    paths: Sequence[str],
+    per_item_avg: Optional[np.ndarray],
+    saved_names: List[str],
+    need_alt_output: bool,
+    file_id_map: Dict[str, int],
+    cluster_avg: Optional[float],
+    naming_mode: str,
+    dist_matrix: Optional[np.ndarray],
+) -> Optional[dict]:
+    if not need_alt_output:
+        return None
+
+    alt_items = []
+    for local_idx, original_idx in enumerate(cluster):
+        item_path = paths[original_idx]
+        if item_path not in file_id_map:
+            file_id_map[item_path] = len(file_id_map) + 1
+        file_id = file_id_map[item_path]
+        item_entry = {"file_id": file_id}
+        if per_item_avg is not None and local_idx < len(per_item_avg):
+            item_entry["average_distance"] = float(per_item_avg[local_idx])
+        if saved_names and local_idx < len(saved_names):
+            item_entry["file_name"] = saved_names[local_idx]
+        alt_items.append(item_entry)
+
+    cluster_alt = {
+        "id": idx,
+        "size": len(cluster),
+        "items": alt_items,
+    }
+    if cluster_avg is not None:
+        cluster_alt["average_distance"] = float(cluster_avg)
+
+    if naming_mode == "distance_plus" and dist_matrix is not None and dist_matrix.size > 0 and alt_items:
+        pairwise = {}
+        for local_idx, item_entry in enumerate(alt_items):
+            related = {}
+            for other_idx, other_entry in enumerate(alt_items):
+                if other_idx == local_idx:
+                    continue
+                related[str(other_entry["file_id"])] = float(dist_matrix[local_idx, other_idx])
+            pairwise[str(item_entry["file_id"])] = related
+        cluster_alt["pairwise_distances"] = pairwise
+
+    return cluster_alt
+
+
+def _copy_discarded_if_needed(
+    paths: Sequence[str],
+    result: ClusterResult,
+    base_dir: str,
+    config: Config,
+    save_discarded: bool,
+) -> None:
+    if not result.discarded or config.misc.list_only:
+        return
+
+    if save_discarded:
+        noise_dir = os.path.join(base_dir, "unclustered")
+        copy_and_rename(paths, result.discarded, noise_dir, config)
+    else:
+        LOGGER.info("Skipping save of unclustered images because --save_discarded=false was set.")
+
+
+def _write_default_summary(
+    base_dir: str,
+    paths: Sequence[str],
+    result: ClusterResult,
+    config: Config,
+    naming_mode: str,
+    clusters_summary: List[dict],
+) -> str:
+    summary = {
+        "algorithm": getattr(config.clustering, "algorithm", "distance"),
+        "threshold": config.clustering.threshold,
+        "similarity_percent": config.clustering.similarity_percent,
+        "min_cluster_size": config.clustering.min_size,
+        "naming_mode": naming_mode,
+        "cluster_count": len(result.clusters),
+        "discarded_count": len(result.discarded),
+        "clusters": clusters_summary,
+        "discarded_paths": [paths[item] for item in result.discarded],
+        "pca": {
+            "enabled": bool(getattr(config.clustering, "pca_enabled", False)),
+            "requested_components": int(getattr(config.clustering, "pca_components", 0)),
+            "effective_components": int(
+                getattr(
+                    config.clustering,
+                    "_pca_effective_components",
+                    getattr(config.clustering, "pca_components", 0),
+                )
+            )
+            if getattr(config.clustering, "pca_enabled", False)
+            else None,
+            "whiten": bool(getattr(config.clustering, "pca_whiten", True)),
+        },
+    }
+    summary_path = os.path.join(base_dir, "clusters.json")
+    with open(summary_path, "w", encoding="utf-8") as handle:
+        json.dump(summary, handle, ensure_ascii=False, indent=2)
+
+    if config.misc.list_only:
+        LOGGER.info(json.dumps(summary, ensure_ascii=False, indent=2))
+    else:
+        LOGGER.info(f"Cluster artifacts saved to: {base_dir}")
+    return summary_path
+
+
+def _write_json_summary(
+    base_dir: str,
+    config: Config,
+    file_id_map: Dict[str, int],
+    alt_clusters: List[dict],
+) -> str:
+    files_section = {path: file_id for path, file_id in sorted(file_id_map.items(), key=lambda item: item[1])}
+    payload = {
+        "algorithm": getattr(config.clustering, "algorithm", "distance"),
+        "pca": {
+            "enabled": bool(getattr(config.clustering, "pca_enabled", False)),
+            "requested_components": int(getattr(config.clustering, "pca_components", 0)),
+            "effective_components": int(
+                getattr(
+                    config.clustering,
+                    "_pca_effective_components",
+                    getattr(config.clustering, "pca_components", 0),
+                )
+            )
+            if getattr(config.clustering, "pca_enabled", False)
+            else None,
+            "whiten": bool(getattr(config.clustering, "pca_whiten", True)),
+        },
+        "files": files_section,
+        "clusters": alt_clusters,
+    }
+    summary_path = os.path.join(base_dir, "clusters.json")
+    with open(summary_path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, ensure_ascii=False, indent=2)
+    LOGGER.info(f"Cluster data saved to JSON: {summary_path}")
+    return summary_path
+
+
+def _print_summary(file_id_map: Dict[str, int], alt_clusters: List[dict]) -> str:
+    summary_path = "<stdout>"
+    print("file,fileId")
+    for path, file_id in sorted(file_id_map.items(), key=lambda item: item[1]):
+        print(f"{path},{file_id}")
+    if alt_clusters:
+        print()
+    for cluster_alt in alt_clusters:
+        fields = [
+            f"cluster_{cluster_alt['id']:03d}",
+            f"{cluster_alt['size']}",
+        ]
+        avg_value = cluster_alt.get("average_distance")
+        if avg_value is not None:
+            fields.append(f"averageDist={avg_value:.6f}")
+        for item_entry in cluster_alt["items"]:
+            fields.append(str(item_entry["file_id"]))
+            avg_item = item_entry.get("average_distance")
+            if avg_item is not None:
+                fields.append(f"{avg_item:.6f}")
+            else:
+                fields.append("")
+        print(",".join(fields))
+    LOGGER.info("Cluster data printed to console in CSV format.")
+    return summary_path
+
+
+def _finalize_cluster_export(
+    base_dir: str,
+    paths: Sequence[str],
+    result: ClusterResult,
+    config: Config,
+    naming_mode: str,
+    save_mode: str,
+    save_discarded: bool,
+    clusters_summary: List[dict],
+    alt_clusters: List[dict],
+    file_id_map: Dict[str, int],
+) -> str:
+    if save_mode == "default":
+        _copy_discarded_if_needed(paths, result, base_dir, config, save_discarded)
+        return _write_default_summary(base_dir, paths, result, config, naming_mode, clusters_summary)
+    if save_mode == "json":
+        return _write_json_summary(base_dir, config, file_id_map, alt_clusters)
+    return _print_summary(file_id_map, alt_clusters)
+
+
 def export_clusters(
     paths: Sequence[str],
     feats: np.ndarray,
@@ -654,405 +1303,39 @@ def export_clusters(
 ) -> Tuple[str, int, int]:
     """Persist cluster results to disk and return summary stats."""
     base_dir = config.files.dst_folder
-    save_mode = str(getattr(config.clustering, "save_mode", "default")).lower()
-    if save_mode not in {"default", "json", "print", "group_filling"}:
-        save_mode = "default"
-    raw_discard_flag = getattr(config.clustering, "save_discarded", True)
-    if isinstance(raw_discard_flag, str):
-        lowered_flag = raw_discard_flag.strip().lower()
-        save_discarded = lowered_flag not in {"0", "false", "no", "off"}
-    else:
-        save_discarded = bool(raw_discard_flag)
+    save_mode = _resolve_save_mode(config)
+    save_discarded = _resolve_save_discarded(config)
 
     if save_mode in {"default", "json", "group_filling"}:
         os.makedirs(base_dir, exist_ok=True)
 
-    # Special mode: flatten clusters into fixed-size groups with filling by discarded
     if save_mode == "group_filling":
-        group_size = int(getattr(config.clustering, "group_filling_size", 10) or 10)
-        if group_size <= 0:
-            group_size = 10
-        split_mode = str(getattr(config.clustering, "cluster_splitting_mode", "recluster") or "recluster").lower()
-        if split_mode not in {"recluster", "fi"}:
-            split_mode = "recluster"
-
-        # Helpers for splitting large clusters
-        def _split_cluster_by_fi(cluster: List[int]) -> List[List[int]]:
-            if len(cluster) <= group_size:
-                return [cluster]
-            sub_feats = feats[cluster]
-            local_order = farthest_insertion_path(sub_feats, config)
-            mapped = [cluster[int(i)] for i in local_order]
-            chunks: List[List[int]] = []
-            for s in range(0, len(mapped), group_size):
-                chunks.append(mapped[s:s + group_size])
-            return chunks
-
-        def _split_cluster_by_recluster(cluster: List[int]) -> List[List[int]]:
-            if len(cluster) <= group_size:
-                return [cluster]
-
-            # Binary search on threshold to enforce max size <= group_size
-            base_thr = float(getattr(config.clustering, "threshold", 0.35) or 0.35)
-            if base_thr <= 0:
-                return _split_cluster_by_fi(cluster)
-            lo = max(1e-6, base_thr * 1e-4)
-            hi = base_thr
-            best: List[List[int]] = []
-            found = False
-
-            # Save original settings to restore after temporary modifications
-            orig_thr = float(config.clustering.threshold)
-            orig_min = int(config.clustering.min_size)
-            try:
-                # Always allow singletons inside re-cluster step
-                for _ in range(14):
-                    mid = 0.5 * (lo + hi)
-                    config.clustering.threshold = mid
-                    config.clustering.min_size = 1
-                    sub_feats = feats[cluster]
-                    sub_res = cluster_by_distance(sub_feats, config, use_gpu=False)
-                    # Map back to original indices; no discards expected (min_size=1)
-                    sub_clusters = [[cluster[i] for i in part] for part in sub_res.clusters]
-                    max_size = max((len(c) for c in sub_clusters), default=0)
-                    if max_size <= group_size and len(sub_clusters) > 0:
-                        found = True
-                        best = sub_clusters
-                        # try to loosen a bit to reduce fragmentation
-                        lo = mid
-                    else:
-                        hi = mid
-                    if hi - lo <= base_thr * 1e-4:
-                        break
-            except Exception:
-                # Fallback to FI if anything goes wrong
-                best = []
-                found = False
-            finally:
-                config.clustering.threshold = orig_thr
-                config.clustering.min_size = orig_min
-
-            if not found or not best:
-                return _split_cluster_by_fi(cluster)
-
-            # Ensure resulting parts are chunked by group_size if any part still exceeds (safety)
-            out: List[List[int]] = []
-            for part in best:
-                if len(part) <= group_size:
-                    out.append(part)
-                else:
-                    for s in range(0, len(part), group_size):
-                        out.append(part[s:s + group_size])
-            return out
-
-        # 1) Prepare clusters: split large ones per chosen mode
-        prepared: List[List[int]] = []
-        for cl in result.clusters:
-            if len(cl) <= group_size:
-                prepared.append(list(cl))
-            else:
-                if split_mode == "fi":
-                    prepared.extend(_split_cluster_by_fi(list(cl)))
-                else:  # recluster
-                    prepared.extend(_split_cluster_by_recluster(list(cl)))
-
-        # Stats: prepared clusters
-        if prepared:
-            sizes = np.array([len(c) for c in prepared], dtype=np.int32)
-            LOGGER.debug(
-                f"[group_filling] prepared_clusters={len(prepared)} size_min={int(sizes.min())} "
-                f"median={int(np.median(sizes))} max={int(sizes.max())}"
-            )
-        else:
-            LOGGER.debug("[group_filling] no clusters after preparation (all discarded or empty input)")
-
-        from collections import deque
-        all_discards = list(result.discarded if save_discarded else [])
-
-        def build_cluster_groups(clusters: List[List[int]], by_size_desc: bool) -> List[List[int]]:
-            items = list(clusters)
-            if by_size_desc:
-                items = sorted(items, key=lambda c: len(c), reverse=True)
-            groups: List[List[int]] = []
-            current: List[List[int]] = []  # store clusters for the current group (list of lists)
-            used_cap = 0
-            if not by_size_desc:
-                # original order, sequential pack
-                idx = 0
-                while idx < len(items):
-                    if used_cap + len(items[idx]) <= group_size:
-                        current.append(items[idx])
-                        used_cap += len(items[idx])
-                        idx += 1
-                    else:
-                        groups.append([x for part in current for x in part])
-                        current = []
-                        used_cap = 0
-                if current:
-                    groups.append([x for part in current for x in part])
-            else:
-                # first-fit decreasing bin pack by cluster size
-                bins: List[Tuple[int, List[List[int]]]] = []  # (used_cap, [clusters])
-                for cl in items:
-                    placed = False
-                    for bi in range(len(bins)):
-                        cap, arr = bins[bi]
-                        if cap + len(cl) <= group_size:
-                            arr.append(cl)
-                            bins[bi] = (cap + len(cl), arr)
-                            placed = True
-                            break
-                    if not placed:
-                        bins.append((len(cl), [cl]))
-                for cap, arr in bins:
-                    groups.append([x for part in arr for x in part])
-            return groups
-
-        def fill_groups_with_discards(groups_cluster_only: List[List[int]], discards: List[int]) -> Tuple[List[int], int, int, int]:
-            dq = deque(discards)
-            seq: List[int] = []
-            disc_used = 0
-            groups_filled = 0
-            groups_incomplete = 0
-            for g in groups_cluster_only:
-                seq.extend(g)
-                gap = max(0, group_size - len(g))
-                if gap > 0:
-                    groups_filled += 1
-                used_here = 0
-                while gap > 0 and dq:
-                    seq.append(int(dq.popleft()))
-                    disc_used += 1
-                    used_here += 1
-                    gap -= 1
-                if gap > 0:
-                    groups_incomplete += 1
-            # append remaining discards at the end
-            if dq:
-                seq.extend(list(dq))
-            return seq, disc_used, groups_filled, groups_incomplete
-
-        # Phase 1: original-order greedy packing
-        groups_seq_order = build_cluster_groups(prepared, by_size_desc=False)
-        holes_total = sum(max(0, group_size - len(g)) for g in groups_seq_order)
-        need_repack = len(all_discards) < holes_total and len(prepared) > 0
-        LOGGER.debug(
-            f"[group_filling] phase1 groups={len(groups_seq_order)} holes={holes_total} "
-            f"discards_avail={len(all_discards)} repack={'yes' if need_repack else 'no'}"
-        )
-
-        if need_repack:
-            # Phase 2: FFD repack to reduce holes
-            groups_ffd = build_cluster_groups(prepared, by_size_desc=True)
-            holes_ffd = sum(max(0, group_size - len(g)) for g in groups_ffd)
-            LOGGER.debug(
-                f"[group_filling] phase2 FFD groups={len(groups_ffd)} holes={holes_ffd} (improved={holes_ffd < holes_total})"
-            )
-            target_groups = groups_ffd
-        else:
-            target_groups = groups_seq_order
-
-        sequence, disc_used, groups_filled, groups_incomplete = fill_groups_with_discards(target_groups, all_discards)
-        LOGGER.debug(
-            f"[group_filling] filled_groups={groups_filled} groups_incomplete={groups_incomplete} discards_used={disc_used}"
-        )
-
-        # Save in the computed order
-        if not config.misc.list_only:
-            copy_and_rename(paths, sequence, base_dir, config)
-        LOGGER.info(
-            f"Group-filling output saved to: {base_dir} (groups of {group_size}, split={split_mode})."
-        )
-        return base_dir, len(result.clusters), len(result.discarded)
+        return _export_group_filling(paths, feats, result, config, base_dir, save_discarded)
 
     naming_mode = getattr(config.clustering, "naming_mode", "default")
-    # JSON/print modes require distance statistics even if the naming mode would not.
     compute_distances = naming_mode in {"distance", "distance_plus"} or save_mode in {"json", "print"}
 
-    clusters_summary: List[dict] = []
-    need_alt_output = save_mode in {"json", "print"}
-    alt_clusters: List[dict] = []
-    file_id_map: dict = {} if need_alt_output else {}
+    clusters_summary, alt_clusters, file_id_map = _build_cluster_payloads(
+        paths,
+        feats,
+        result,
+        config,
+        base_dir,
+        save_mode,
+        naming_mode,
+        compute_distances,
+    )
 
-    for idx, cluster in enumerate(result.clusters, start=1):
-        cluster_paths = [paths[item] for item in cluster]
-        cluster_feats = feats[cluster] if cluster else np.empty((0, feats.shape[1]), dtype=feats.dtype)
-
-        dist_matrix = None
-        cluster_avg = None
-        per_item_avg = None
-
-        if compute_distances and len(cluster) > 0:
-            # Use memory-safe computation; limit full matrix creation to manageable cluster sizes.
-            limit = int(getattr(config.clustering, "pairwise_limit", 1200))
-            chunk = int(getattr(config.clustering, "distance_chunk_size", 1024))
-            dist_matrix, cluster_avg, per_item_avg = _compute_cluster_distances(cluster_feats, limit, chunk)
-        elif len(cluster) == 0:
-            dist_matrix = np.zeros((0, 0), dtype=np.float32)
-            cluster_avg = 0.0
-            per_item_avg = np.zeros((0,), dtype=np.float32)
-
-        folder_name = f"cluster_{idx:03d}"
-        if naming_mode in {"distance", "distance_plus"} and cluster_avg is not None:
-            folder_name = f"{idx:03d}-{_format_distance(cluster_avg)}"
-
-        cluster_dir = os.path.join(base_dir, folder_name)
-        distance_names: List[str] = []
-        if naming_mode in {"distance", "distance_plus"} and per_item_avg is not None and len(cluster) > 0:
-            distance_names = _build_distance_based_names(paths, cluster, per_item_avg)
-        saved_names: List[str] = list(distance_names) if distance_names else []
-
-        if save_mode == "default":
-            if not config.misc.list_only:
-                if distance_names:
-                    _copy_with_custom_names(paths, cluster, distance_names, cluster_dir, config)
-                    if naming_mode == "distance_plus" and dist_matrix is not None and dist_matrix.size > 0:
-                        _write_pairwise_json(cluster_dir, dist_matrix)
-                else:
-                    copy_and_rename(paths, cluster, cluster_dir, config)
-            elif distance_names:
-                saved_names = list(distance_names)
-        elif distance_names and config.misc.list_only:
-            saved_names = list(distance_names)
-
-        cluster_entry = {
-            "id": idx,
-            "size": len(cluster),
-            "folder_name": folder_name,
-            "paths": cluster_paths,
-        }
-        if cluster_avg is not None:
-            cluster_entry["average_distance"] = float(cluster_avg)
-
-        items = []
-        for local_idx, original_idx in enumerate(cluster):
-            item_info = {"path": paths[original_idx]}
-            if per_item_avg is not None and local_idx < len(per_item_avg):
-                item_info["average_distance"] = float(per_item_avg[local_idx])
-            if saved_names:
-                item_info["file_name"] = saved_names[local_idx]
-            items.append(item_info)
-        cluster_entry["items"] = items
-
-        if (
-            naming_mode == "distance_plus"
-            and save_mode == "default"
-            and not config.misc.list_only
-            and len(cluster_paths) > 0
-        ):
-            cluster_entry["pairwise_json"] = os.path.join(folder_name, "cluster_distances.json")
-
-        clusters_summary.append(cluster_entry)
-
-        if need_alt_output:
-            alt_items = []
-            for local_idx, original_idx in enumerate(cluster):
-                item_path = paths[original_idx]
-                if item_path not in file_id_map:
-                    file_id_map[item_path] = len(file_id_map) + 1
-                file_id = file_id_map[item_path]
-                item_entry = {"file_id": file_id}
-                if per_item_avg is not None and local_idx < len(per_item_avg):
-                    item_entry["average_distance"] = float(per_item_avg[local_idx])
-                if saved_names:
-                    item_entry["file_name"] = saved_names[local_idx]
-                alt_items.append(item_entry)
-
-            cluster_alt = {
-                "id": idx,
-                "size": len(cluster),
-                "items": alt_items,
-            }
-            if cluster_avg is not None:
-                cluster_alt["average_distance"] = float(cluster_avg)
-
-            if naming_mode == "distance_plus" and dist_matrix is not None and dist_matrix.size > 0 and alt_items:
-                pairwise = {}
-                for local_idx, item_entry in enumerate(alt_items):
-                    related = {}
-                    for other_idx, other_entry in enumerate(alt_items):
-                        if other_idx == local_idx:
-                            continue
-                        related[str(other_entry["file_id"])] = float(dist_matrix[local_idx, other_idx])
-                    pairwise[str(item_entry["file_id"])] = related
-                cluster_alt["pairwise_distances"] = pairwise
-
-            alt_clusters.append(cluster_alt)
-
-    if save_mode == "default" and not config.misc.list_only and result.discarded and save_discarded:
-        noise_dir = os.path.join(base_dir, "unclustered")
-        copy_and_rename(paths, result.discarded, noise_dir, config)
-    elif save_mode == "default" and not config.misc.list_only and result.discarded and not save_discarded:
-        LOGGER.info("Skipping save of unclustered images because --save_discarded=false was set.")
-
-    summary_path: str
-
-    if save_mode == "default":
-        summary = {
-            "algorithm": getattr(config.clustering, "algorithm", "distance"),
-            "threshold": config.clustering.threshold,
-            "similarity_percent": config.clustering.similarity_percent,
-            "min_cluster_size": config.clustering.min_size,
-            "naming_mode": naming_mode,
-            "cluster_count": len(result.clusters),
-            "discarded_count": len(result.discarded),
-            "clusters": clusters_summary,
-            "discarded_paths": [paths[item] for item in result.discarded],
-            "pca": {
-                "enabled": bool(getattr(config.clustering, "pca_enabled", False)),
-                "requested_components": int(getattr(config.clustering, "pca_components", 0)),
-                "effective_components": int(getattr(config.clustering, "_pca_effective_components", getattr(config.clustering, "pca_components", 0))) if getattr(config.clustering, "pca_enabled", False) else None,
-                "whiten": bool(getattr(config.clustering, "pca_whiten", True)),
-            },
-        }
-        summary_path = os.path.join(base_dir, "clusters.json")
-        with open(summary_path, "w", encoding="utf-8") as handle:
-            json.dump(summary, handle, ensure_ascii=False, indent=2)
-
-        if config.misc.list_only:
-            LOGGER.info(json.dumps(summary, ensure_ascii=False, indent=2))
-        else:
-            LOGGER.info(f"Cluster artifacts saved to: {base_dir}")
-    elif save_mode == "json":
-        files_section = {path: file_id for path, file_id in sorted(file_id_map.items(), key=lambda item: item[1])}
-        payload = {
-            "algorithm": getattr(config.clustering, "algorithm", "distance"),
-            "pca": {
-                "enabled": bool(getattr(config.clustering, "pca_enabled", False)),
-                "requested_components": int(getattr(config.clustering, "pca_components", 0)),
-                "effective_components": int(getattr(config.clustering, "_pca_effective_components", getattr(config.clustering, "pca_components", 0))) if getattr(config.clustering, "pca_enabled", False) else None,
-                "whiten": bool(getattr(config.clustering, "pca_whiten", True)),
-            },
-            "files": files_section,
-            "clusters": alt_clusters,
-        }
-        summary_path = os.path.join(base_dir, "clusters.json")
-        with open(summary_path, "w", encoding="utf-8") as handle:
-            json.dump(payload, handle, ensure_ascii=False, indent=2)
-        LOGGER.info(f"Cluster data saved to JSON: {summary_path}")
-    else:  # save_mode == "print"
-        summary_path = "<stdout>"
-        print("file,fileId")
-        for path, file_id in sorted(file_id_map.items(), key=lambda item: item[1]):
-            print(f"{path},{file_id}")
-        if alt_clusters:
-            print()
-        for cluster_alt in alt_clusters:
-            fields = [
-                f"cluster_{cluster_alt['id']:03d}",
-                f"{cluster_alt['size']}",
-            ]
-            avg_value = cluster_alt.get("average_distance")
-            if avg_value is not None:
-                fields.append(f"averageDist={avg_value:.6f}")
-            for item_entry in cluster_alt["items"]:
-                fields.append(str(item_entry["file_id"]))
-                avg_item = item_entry.get("average_distance")
-                if avg_item is not None:
-                    fields.append(f"{avg_item:.6f}")
-                else:
-                    fields.append("")
-            print(",".join(fields))
-        LOGGER.info("Cluster data printed to console in CSV format.")
-
+    summary_path = _finalize_cluster_export(
+        base_dir,
+        paths,
+        result,
+        config,
+        naming_mode,
+        save_mode,
+        save_discarded,
+        clusters_summary,
+        alt_clusters,
+        file_id_map,
+    )
     return summary_path, len(result.clusters), len(result.discarded)

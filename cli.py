@@ -7,10 +7,12 @@ from typing import List, Tuple, Dict, Any
 import torch
 from config import Config
 from logger import CustomLogger, LogLevel
+from models import MODEL_CONFIGS, set_model_logger
+from model_factory import set_model_factory_runtime
 
 
-# CLI schema (single source of truth)
-# - tags: TaskStarter, FinalTaskStarter, Task, Param, NonTerminal (unused here)
+# CLI schema
+# - tags: TaskStarter, FinalTaskStarter, Task, Param, NonTerminal
 # - subparams: dict of logical sub-keys for grouped syntax, each with names/type/dest
 CLI_SPEC: List[Dict[str, Any]] = [
     {
@@ -29,6 +31,7 @@ CLI_SPEC: List[Dict[str, Any]] = [
             "cluster_pca": {"names": ["pca", "cluster_pca"], "type": "bool", "dest": "cluster_pca"},
             "group_filling_size": {"names": ["group_filling_size", "group_size", "x"], "type": "int", "dest": "group_filling_size"},
             "cluster_splitting_mode": {"names": ["cluster_splitting_mode", "split_mode"], "type": "str", "dest": "cluster_splitting_mode"},
+            "similar_fill": {"names": ["similar_fill", "similar_filling"], "type": "bool", "dest": "cluster_similar_fill"},
         },
     },
     {
@@ -43,7 +46,6 @@ CLI_SPEC: List[Dict[str, Any]] = [
             "two_opt_block_size": {"names": ["two_opt_block_size"], "type": "int", "dest": "two_opt_block_size"},
             "sort_optimizer": {"names": ["sort_optimizer"], "type": "str", "dest": "sort_optimizer"},
             "sort_strategy": {"names": ["sort_strategy", "strategy"], "type": "str", "dest": "sort_strategy"},
-            "list_only": {"names": ["list_only"], "type": "bool", "dest": "list_only"},
         },
     },
     {
@@ -74,7 +76,37 @@ CLI_SPEC: List[Dict[str, Any]] = [
     {"names": ["--list_objects"], "action": "store_true", "help": "List DB file paths.", "tags": ["Task"]},
     {"names": ["--move_db"], "type": str, "nargs": 2, "help": "Move DB entries OLD_ROOT NEW_ROOT.", "tags": ["Task"]},
     {"names": ["--print_params"], "type": str, "choices": ["all", "entered"], "help": "Print parameters before run.", "tags": ["Param"]},
+    {"names": ["--list_only"], "action": "store_true", "tags": ["Param"]}
 ]
+
+
+def _build_supported_models_help() -> str:
+    if not MODEL_CONFIGS:
+        return "  (no models registered)"
+    longest_name = max(len(name) for name in MODEL_CONFIGS)
+    lines = []
+    for name in sorted(MODEL_CONFIGS):
+        flops = MODEL_CONFIGS[name].get("flops") or "n/a"
+        lines.append(f"  {name.ljust(longest_name)}  {flops}")
+    return "\n".join(lines)
+
+
+SUPPORTED_MODELS_HELP = _build_supported_models_help()
+
+
+def _build_help_epilog() -> str:
+    examples = textwrap.dedent(
+        """Examples:
+  --cluster algorithm=dbscan:threshold=0.3
+  --sorting lookahead=4:sort_optimizer=2opt
+  --find path/to/query.jpg find_result_type=both
+  --move_db OLD_ROOT NEW_ROOT --list_objects
+"""
+    ).rstrip()
+    return f"{examples}\n\nSupported models (FLOPs):\n{SUPPORTED_MODELS_HELP}"
+
+
+PARSER_EPILOG = _build_help_epilog()
 
 
 def _first_long_name(names: List[str]) -> str:
@@ -154,7 +186,6 @@ def _apply_group(parent_flag: str, group_token: str, args: argparse.Namespace) -
             val = True if v == "" else _parse_bool(v)
         else:
             val = v
-        setattr(args, dest, val)
         # record dotted for reporting
         parent_key = parent_flag.lstrip('-')
         subname = dest
@@ -168,14 +199,7 @@ def _apply_group(parent_flag: str, group_token: str, args: argparse.Namespace) -
 parser = argparse.ArgumentParser(
     description="Neusort CLI",
     formatter_class=argparse.RawDescriptionHelpFormatter,
-    epilog=textwrap.dedent(
-        """Examples:
-  --cluster algorithm=dbscan:threshold=0.3
-  --sorting lookahead=4:sort_optimizer=2opt
-  --find path/to/query.jpg find_result_type=both
-  --move_db OLD_ROOT NEW_ROOT --list_objects
-"""
-    ),
+    epilog=PARSER_EPILOG,
 )
 
 for spec in CLI_TOP_SPECS:
@@ -281,38 +305,14 @@ def _collect_entered_params(tokens: List[str]) -> Dict[str, Any]:
 
 ENTERED_PARAMS = _collect_entered_params(raw_cli_args)
 
-if getattr(args, "print_params", None) in ("all", "entered"):
-    try:
-        if args.print_params == "entered":
-            for dk, dv in ENTERED_GROUPED.items():
-                print(f"{dk}={dv}")
-            for k, v in ENTERED_PARAMS.items():
-                attr = k.lstrip('-').replace('-', '_')
-                print(f"{attr}={v}")
-        else:
-            attrs = set()
-            # known top-level attrs
-            for spec in CLI_TOP_SPECS:
-                for nm in spec["names"]:
-                    attrs.add(nm.lstrip('-').replace('-', '_'))
-            # known subparam dests
-            for submap in PARENT_SUBPARAM_MAP.values():
-                for dest, _t in submap.values():
-                    attrs.add(dest)
-            for attr in sorted(attrs):
-                v = getattr(args, attr, None)
-                if v is not None and v is not False:
-                    print(f"{attr}={v}")
-    except Exception:
-        pass
 
 
-# Ensure presence of expected attributes for Config
-if not hasattr(args, "list_only"):
-    setattr(args, "list_only", False)
-
-LOGGER = CustomLogger(level=LogLevel(getattr(args, "loglevel", "default")))
-CONFIG = Config(args)
+LOGGER = CustomLogger(level=LogLevel(getattr(args, "loglevel", None) or "default"))
+set_model_logger(LOGGER)
+set_model_factory_runtime(logger=LOGGER)
+# Pass grouped sub-params separately to Config so that subparam namespaces
+# remain isolated per parent flag and are not read from argparse attrs.
+CONFIG = Config(args, ENTERED_GROUPED)
 
 
 if CONFIG.model.use_cpu:
@@ -320,6 +320,8 @@ if CONFIG.model.use_cpu:
     LOGGER.info("Using CPU for model inference")
 else:
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+set_model_factory_runtime(device=DEVICE)
+    
 """
 Neusort CLI — Developer Guide
 
@@ -404,3 +406,59 @@ Notes
 - If multiple FinalTaskStarter flags are given, only the first is executed; others are ignored.
 - NonTerminal items are not exposed via CLI; they should be defaulted in code.
 """
+
+# Optional parameters printing
+if getattr(args, "print_params", None) in ("all", "entered"):
+    try:
+        if args.print_params == "entered":
+            for dk, dv in ENTERED_GROUPED.items():
+                print(f"{dk}={dv}")
+            for k, v in ENTERED_PARAMS.items():
+                attr = k.lstrip('-').replace('-', '_')
+                print(f"{attr}={v}")
+        else:
+            # Top-level args that were set or have values
+            attrs = set()
+            for spec in CLI_TOP_SPECS:
+                for nm in spec["names"]:
+                    attrs.add(nm.lstrip('-').replace('-', '_'))
+            for attr in sorted(attrs):
+                v = getattr(args, attr, None)
+                if v is not None and v is not False:
+                    print(f"{attr}={v}")
+
+            # Effective SubParams from Config, printed as dotted keys
+            printed = set()
+            for parent_flag, submap in PARENT_SUBPARAM_MAP.items():
+                parent_key = parent_flag.lstrip('-')
+                cfg_obj = None
+                if parent_key == 'cluster':
+                    cfg_obj = CONFIG.clustering
+                elif parent_key == 'sorting':
+                    cfg_obj = CONFIG.sorting
+                elif parent_key == 'find':
+                    cfg_obj = CONFIG.search
+                if cfg_obj is None:
+                    continue
+                # unique dests for this parent
+                dests = {dest for (dest, _t) in submap.values()}
+                for dest in sorted(dests):
+                    subname = dest
+                    if subname.startswith(parent_key + "_"):
+                        subname = subname[len(parent_key) + 1 :]
+                    # map to config attribute name if needed
+                    cfg_attr = subname
+                    if parent_key == 'cluster':
+                        if subname == 'pca':
+                            cfg_attr = 'pca_enabled'
+                        elif subname == 'splitting_mode':
+                            cfg_attr = 'cluster_splitting_mode'
+                    v = getattr(cfg_obj, cfg_attr, None)
+                    key = f"{parent_key}.{subname}"
+                    if key in printed:
+                        continue
+                    if v is not None and v is not False:
+                        printed.add(key)
+                        print(f"{key}={v}")
+    except Exception:
+        pass

@@ -1,12 +1,25 @@
 import os
 import threading
+from typing import Optional
 
-from cli import DEVICE, LOGGER
-from models import MODEL_CONFIGS
 import torch
-from PIL import Image
 import torch.nn as nn
+from PIL import Image
+
+from logger import CustomLogger
+from models import MODEL_CONFIGS
 from clip_manager import CLIP_PROCESSOR_MANAGER
+
+DEVICE = torch.device("cpu")
+LOGGER: CustomLogger = CustomLogger()
+
+
+def set_model_factory_runtime(*, device: Optional[torch.device] = None, logger: Optional[CustomLogger] = None) -> None:
+    global DEVICE, LOGGER
+    if device is not None:
+        DEVICE = device
+    if logger is not None:
+        LOGGER = logger
 
 def find_final_linear_module(model):
     """
@@ -297,3 +310,90 @@ def create_torchvision_model(model_name, cfg):
     target_module.register_forward_hook(hook_fn)
 
     return model, hook_blob
+
+
+def create_timm_hf_model(model_name, cfg):
+    """
+    Load a timm model from Hugging Face Hub (hf-hub:repo_id), attach a forward hook
+    to capture the embedding right before the final Linear classifier, and infer feat_dim.
+    """
+    import threading
+    import torch
+    try:
+        from timm import create_model as timm_create_model
+    except Exception as e:
+        raise RuntimeError(
+            "timm is not installed. Please `pip install timm>=0.9 huggingface_hub`."
+        ) from e
+
+    hook_blob = {"tls": threading.local()}
+    repo_id = cfg["weights"]
+
+    try:
+        model = timm_create_model(f"hf-hub:{repo_id}", pretrained=True)
+    except Exception as e:
+        raise RuntimeError(
+            "Не удалось загрузить timm-модель с HF Hub. Убедитесь, что установлены timm и huggingface_hub,"
+            " и что вы приняли условия доступа к репозиторию модели на HF."
+        ) from e
+
+    model.to(DEVICE).eval()
+
+    # Setup hook on input to final classifier (embedding)
+    group, idx_or_name = setup_hook(model, cfg)
+    target_module = determine_feature_dim(model, group, idx_or_name)
+
+    def hook_fn(module, input, output):
+        # Take input to classifier as feature
+        hook_blob["tls"].feat = input[0].detach().cpu().clone()
+
+    target_module.register_forward_hook(hook_fn)
+
+    # Optionally refine input_size from pretrained_cfg
+    try:
+        sz = None
+        pcfg = getattr(model, "pretrained_cfg", None) or {}
+        test_sz = pcfg.get("test_input_size") or pcfg.get("input_size")
+        if isinstance(test_sz, (list, tuple)) and len(test_sz) == 3:
+            sz = int(test_sz[-1])
+        if sz:
+            MODEL_CONFIGS[model_name]["input_size"] = sz
+    except Exception:
+        pass
+
+    # Run a dummy forward to infer feat_dim
+    with torch.no_grad():
+        pix = MODEL_CONFIGS[model_name].get("input_size", 448)
+        dummy = torch.zeros(1, 3, pix, pix, device=DEVICE)
+        _ = model(dummy)
+        feat = getattr(hook_blob["tls"], "feat", None)
+        if feat is None:
+            raise RuntimeError("Hook did not capture features; check hook_target for this model.")
+        MODEL_CONFIGS[model_name]["feat_dim"] = int(feat.shape[-1])
+
+    LOGGER.info(
+        f"{model_name}: timm(hf-hub:{repo_id}) loaded, feat_dim={MODEL_CONFIGS[model_name]['feat_dim']}, "
+        f"input_size={MODEL_CONFIGS[model_name].get('input_size')}"
+    )
+    return model, hook_blob
+
+
+"""
+"mobilenet_v3_small": "small MobileNetV3 model for CPU / low-memory GPU...",
+"mobilenet_v3_large": "large MobileNetV3 model for better accuracy, still fast...",
+"convnext_small": "ConvNeXt small model, good balance of speed and accuracy.",
+"regnet_y_400mf": "RegNetY 400MF, very fast, low accuracy.",
+"regnet_y_800mf": "RegNetY 800MF, fast, moderate accuracy.",
+"regnet_y_1_6gf": "RegNetY 1.6GF, balanced speed and accuracy.",
+"regnet_y_3_2gf": "RegNetY 3.2GF, good accuracy, moderate speed.",
+"regnet_y_8gf": "RegNetY 8GF, high accuracy, slower.",
+"regnet_y_16gf": "RegNetY 16GF, very high accuracy, needs more memory.",        
+"regnet_y_32gf": "RegNetY 32GF, extremely high accuracy, high memory usage.",
+"regnet_y_128gf": "RegNetY 128GF, state-of-the-art, very high memory usage.",
+"clip_vit_large": "OpenAI CLIP ViT-Large (ViT-L/14), 336px, good accuracy, needs more memory.",
+"clip_vit_liaon": "LAION CLIP ViT-Huge (ViT-H/14), excellent accuracy.",
+"efficientnet_v2_s": "EfficientNetV2 Small, good balance.",
+"efficientnet_v2_m": "EfficientNetV2 Medium, better accuracy.",
+"efficientnet_v2_l": "EfficientNetV2 Large, high accuracy.",
+"clip_vit_liaon_mega": "LAION CLIP ViT-bigG (ViT-bigG/14), best accuracy, highest memory usage."
+"""

@@ -26,6 +26,11 @@ def extract_feature(path, model, hook_blob, config: Config):
     """
     img = Image.open(path).convert("RGB")
 
+    # Backend and normalization hints from model config
+    cfg = MODEL_CONFIGS.get(config.model.model_name, {})
+    backend = cfg.get("backend", "")
+    norm_kind = cfg.get("normalization", "imagenet")
+
     # --- выбор размера / препроцессинга в зависимости от модели ---
     is_clip = config.model.model_name.startswith("clip_")
     if is_clip:
@@ -35,16 +40,15 @@ def extract_feature(path, model, hook_blob, config: Config):
         if clip_processor is None:
             LOGGER.error("CLIP_PROCESSOR не инициализирован, CLIP-модель не готова к использованию")
     else:
-        if config.model.model_name in ("convnext_small", "mobilenet_v3_small", "mobilenet_v3_large"):
-            pix_dim = 224
-        elif config.model.model_name in ("regnet_y_400mf", "regnet_y_800mf", "regnet_y_1_6gf", "regnet_y_3_2gf", "regnet_y_8gf"):
-            pix_dim = MODEL_CONFIGS.get(config.model.model_name, {}).get("input_size", 232)
-        elif config.model.model_name in ("regnet_y_16gf", "regnet_y_32gf", "regnet_y_128gf"):
-            pix_dim = MODEL_CONFIGS.get(config.model.model_name, {}).get("input_size", 384)
-        elif config.model.model_name in ("efficientnet_v2_m","efficientnet_v2_l","efficientnet_v2_s"):
-            pix_dim = MODEL_CONFIGS.get(config.model.model_name, {}).get("input_size", 480)
-        else:
-            raise ValueError(f"Неизвестная модель: {config.model.model_name}")
+        # Prefer config value; else derive from known families; default to 448
+        pix_dim = MODEL_CONFIGS.get(config.model.model_name, {}).get(
+            "input_size",
+            224 if config.model.model_name in ("convnext_small", "mobilenet_v3_small", "mobilenet_v3_large")
+            else 232 if config.model.model_name in ("regnet_y_400mf", "regnet_y_800mf", "regnet_y_1_6gf", "regnet_y_3_2gf", "regnet_y_8gf")
+            else 384 if config.model.model_name in ("regnet_y_16gf", "regnet_y_32gf", "regnet_y_128gf")
+            else 480 if config.model.model_name in ("efficientnet_v2_m", "efficientnet_v2_l", "efficientnet_v2_s")
+            else 448
+        )
 
     # --- вспомогательная функция: взять feat после forward (hook_blob должен быть заполнен) ---
     def reset_hook_storage():
@@ -96,14 +100,23 @@ def extract_feature(path, model, hook_blob, config: Config):
                     _ = model(x)
                 feat = fetch_feat_from_hook()
         else:
-            # прежний путь для torchvision-моделей
-            preproc = transforms.Compose([
-                transforms.Resize(pix_dim, interpolation=InterpolationMode.BILINEAR),
-                transforms.CenterCrop(pix_dim),
-                transforms.ToTensor(),
-                transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                     std=[0.229, 0.224, 0.225]),
-            ])
+            # torchvision / other backends
+            if backend == "timm_hf" and norm_kind == "clip":
+                preproc = transforms.Compose([
+                    transforms.Resize(pix_dim, interpolation=InterpolationMode.BICUBIC),
+                    transforms.CenterCrop(pix_dim),
+                    transforms.ToTensor(),
+                    transforms.Normalize(mean=[0.48145466, 0.4578275, 0.40821073],
+                                         std=[0.26862954, 0.26130258, 0.27577711]),
+                ])
+            else:
+                preproc = transforms.Compose([
+                    transforms.Resize(pix_dim, interpolation=InterpolationMode.BILINEAR),
+                    transforms.CenterCrop(pix_dim),
+                    transforms.ToTensor(),
+                    transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                                         std=[0.229, 0.224, 0.225]),
+                ])
             x = preproc(img).unsqueeze(0).to(DEVICE)
             with torch.no_grad():
                 _ = model(x)
@@ -124,6 +137,13 @@ def extract_feature(path, model, hook_blob, config: Config):
 
     # Для CLIP используем processor на каждом кропе (если есть), иначе manual transforms
     if is_clip and clip_processor is None:
+        final_transform = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.48145466, 0.4578275, 0.40821073],
+                                 std=[0.26862954, 0.26130258, 0.27577711]),
+        ])
+        resize_after_crop = transforms.Resize((pix_dim, pix_dim), interpolation=InterpolationMode.BICUBIC)
+    elif backend == "timm_hf" and norm_kind == "clip":
         final_transform = transforms.Compose([
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.48145466, 0.4578275, 0.40821073],

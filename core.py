@@ -1,11 +1,12 @@
 # core.py
 
+import os
 import torch
 from database import process_and_cache_features, load_features_from_db
 from sorting import sort_images
 from search import handle_search_pipeline
 import faiss
-from cli import LOGGER
+from cli import LOGGER, ENTERED_GROUPED
 from clustering import (
     cluster_by_distance,
     cluster_by_hdbscan,
@@ -51,6 +52,30 @@ def run_search_pipeline(config, db_file, index_file):
     """
     Pipeline for the --find mode.
     """
+    # Auto-detect query_mode based on what was passed to --find / --query_text
+    search_cfg = getattr(config, "search", None)
+    if search_cfg is not None:
+        find_arg = getattr(search_cfg, "find", None)
+        # Skip pipeline mode and respect explicit query_mode from CLI subparams
+        if find_arg and find_arg != "__PIPE__" and "find.query_mode" not in ENTERED_GROUPED:
+            raw = str(find_arg).strip()
+            # Strip surrounding quotes if the user passed a quoted path literally
+            if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in ("'", '"'):
+                raw = raw[1:-1].strip()
+            normalized = os.path.normpath(raw) if raw else raw
+            has_text = bool(getattr(search_cfg, "query_text", None))
+            is_file = bool(normalized) and os.path.isfile(normalized)
+            if is_file:
+                # Normalize stored path so downstream code works even if slashes/quotes differ
+                search_cfg.find = normalized
+                inferred_mode = "image+text" if has_text else "image"
+            else:
+                inferred_mode = "text"
+            prev_mode = (getattr(search_cfg, "query_mode", "") or "").lower()
+            if prev_mode != inferred_mode:
+                LOGGER.info(f"Auto-detected query_mode='{inferred_mode}' for --find input.")
+                search_cfg.query_mode = inferred_mode
+
     feats, paths = load_features_from_db(db_file)
     if not paths or feats is None or len(paths) == 0:
         LOGGER.error("Search aborted: no features found in the database.")

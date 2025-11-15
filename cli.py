@@ -60,6 +60,13 @@ CLI_SPEC: List[Dict[str, Any]] = [
             "find_neighbors": {"names": ["find_neighbors", "neighbors", "k"], "type": "int", "dest": "find_neighbors"},
             "find_result_type": {"names": ["find_result_type", "result_type", "format"], "type": "str", "dest": "find_result_type"},
             "tsv_neighbors": {"names": ["tsv_neighbors"], "type": "int", "dest": "tsv_neighbors"},
+            "backend": {"names": ["backend"], "type": "str", "dest": "backend"},
+            "query_mode": {"names": ["query_mode", "mode"], "type": "str", "dest": "query_mode"},
+            "fusion_mode": {"names": ["fusion_mode", "fusion"], "type": "str", "dest": "fusion_mode"},
+            "image_weight": {"names": ["image_weight", "w_img"], "type": "float", "dest": "image_weight"},
+            "text_weight": {"names": ["text_weight", "w_txt"], "type": "float", "dest": "text_weight"},
+            "directional_alpha": {"names": ["directional_alpha", "alpha"], "type": "float", "dest": "directional_alpha"},
+            "base_prompt": {"names": ["base_prompt", "base_text"], "type": "str", "dest": "base_prompt"},
         },
     },
     # Files / model / misc / db
@@ -76,7 +83,8 @@ CLI_SPEC: List[Dict[str, Any]] = [
     {"names": ["--list_objects"], "action": "store_true", "help": "List DB file paths.", "tags": ["Task"]},
     {"names": ["--move_db"], "type": str, "nargs": 2, "help": "Move DB entries OLD_ROOT NEW_ROOT.", "tags": ["Task"]},
     {"names": ["--print_params"], "type": str, "choices": ["all", "entered"], "help": "Print parameters before run.", "tags": ["Param"]},
-    {"names": ["--list_only"], "action": "store_true", "tags": ["Param"]}
+    {"names": ["--list_only"], "action": "store_true", "tags": ["Param"]},
+    {"names": ["--query_text"], "type": str, "help": "Text prompt for text or image+text queries.", "tags": ["Param"]}
 ]
 
 
@@ -120,6 +128,17 @@ def _first_long_name(names: List[str]) -> str:
 TOP_NAME_TO_SPEC: Dict[str, Dict[str, Any]] = {}
 CLI_TOP_SPECS: List[Dict[str, Any]] = []
 PARENT_SUBPARAM_MAP: Dict[str, Dict[str, Tuple[str, str]]] = {}
+PARENT_VALUE_DEST: Dict[str, str] = {}
+
+
+def _arg_dest_from_names(names: List[str]) -> str:
+    for n in names:
+        if n.startswith("--"):
+            base = n.lstrip("-")
+            break
+    else:
+        base = names[0].lstrip("-")
+    return base.replace("-", "_")
 
 for spec in CLI_SPEC:
     # record top-level names
@@ -135,8 +154,9 @@ for spec in CLI_SPEC:
             dest = s["dest"]
             typ = s.get("type", "str")
             for alias in s["names"]:
-                submap[alias] = (dest, typ)
+                submap[alias.lower()] = (dest, typ)
         PARENT_SUBPARAM_MAP[parent] = submap
+        PARENT_VALUE_DEST[parent] = _arg_dest_from_names(spec["names"])
 
 
 GROUP_VALUE_SPLIT_PATTERN = re.compile(r":(?=[A-Za-z0-9_\-]+(?:=|$))")
@@ -168,14 +188,26 @@ def _parse_bool(value: str) -> bool:
 def _apply_group(parent_flag: str, group_token: str, args: argparse.Namespace) -> Dict[str, Any]:
     updates: Dict[str, Any] = {}
     spec = PARENT_SUBPARAM_MAP.get(parent_flag, {})
-    for item in _split_group_items(group_token):
+    parent_dest = PARENT_VALUE_DEST.get(parent_flag)
+    parent_value_set = False
+    for idx, item in enumerate(_split_group_items(group_token)):
+        raw_key = item
+        raw_val = ""
         if "=" in item:
-            k, v = item.split("=", 1)
-        else:
-            k, v = item, ""
-        k = k.strip().lower()
-        v = v.strip()
+            raw_key, raw_val = item.split("=", 1)
+        key_clean = raw_key.strip()
+        k = key_clean.lower()
+        v = raw_val.strip()
         if k not in spec:
+            if (
+                not parent_value_set
+                and idx == 0
+                and "=" not in item
+                and parent_dest
+            ):
+                setattr(args, parent_dest, key_clean)
+                parent_value_set = True
+                continue
             _fail_group_argument(f"Unknown sub-argument '{k}' for {parent_flag}.")
         dest, typ = spec[k]
         if typ == "int":

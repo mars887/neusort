@@ -137,6 +137,13 @@ def create_clip_openclip_model(model_name, cfg):
 
     CLIP_PROCESSOR_MANAGER.processor = oc_processor
 
+    def _text_tokenizer(texts):
+        if isinstance(texts, str):
+            texts = [texts]
+        return open_clip.tokenize(texts)
+
+    CLIP_PROCESSOR_MANAGER.text_processor = _text_tokenizer
+
     LOGGER.info(f"proccessor set to {CLIP_PROCESSOR_MANAGER.processor}")
 
     # hook for collecting features
@@ -188,9 +195,9 @@ def create_clip_transformers_model(model_name, cfg):
         hook_blob["tls"].feat = output.detach().cpu().clone()
     model.register_forward_hook(_hook)
 
-    # save processor as global in transformers-compatible form
-    # global CLIP_PROCESSOR
-    CLIP_PROCESSOR = processor
+    # save processor/tokenizer references globally via manager
+    CLIP_PROCESSOR_MANAGER.processor = processor
+    CLIP_PROCESSOR_MANAGER.text_processor = processor
 
     # determine feat dim
     with torch.no_grad():

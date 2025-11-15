@@ -154,6 +154,24 @@ class Config:
                 self.global_knn_batch_size = int(_g('find', 'batch_size', 2048))
                 self.tsv_neighbors = int(_g('find', 'tsv_neighbors', 5))
                 self.find_result_type = str(_g('find', 'find_result_type', 'both'))
+                backend = str(_g('find', 'backend', 'auto') or 'auto').lower()
+                if backend not in {'auto', 'regnet', 'clip'}:
+                    backend = 'auto'
+                self.backend = backend
+                mode = str(_g('find', 'query_mode', 'image') or 'image').lower()
+                if mode not in {'image', 'text', 'image+text'}:
+                    mode = 'image'
+                self.query_mode = mode
+                fusion = str(_g('find', 'fusion_mode', 'simple') or 'simple').lower()
+                if fusion not in {'simple', 'directional'}:
+                    fusion = 'simple'
+                self.fusion_mode = fusion
+                self.image_weight = float(_g('find', 'image_weight', 0.5))
+                self.text_weight = float(_g('find', 'text_weight', 0.5))
+                self.directional_alpha = float(_g('find', 'directional_alpha', 0.7))
+                base_prompt = _g('find', 'base_prompt', 'a photo on a road')
+                self.base_prompt = str(base_prompt) if base_prompt is not None else 'a photo on a road'
+                self.query_text = getattr(args, 'query_text', None)
         self.search = Search(args)
 
         # Группа: Логирование и прочее

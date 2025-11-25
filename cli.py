@@ -1,4 +1,5 @@
 import argparse
+import os
 import re
 import sys
 import textwrap
@@ -11,6 +12,9 @@ from models import MODEL_CONFIGS, set_model_logger
 from model_factory import set_model_factory_runtime
 
 
+DEFAULT_FEATURE_WORKERS = max(1, os.cpu_count() or 1)
+
+
 # CLI schema
 # - tags: TaskStarter, FinalTaskStarter, Task, Param, NonTerminal
 # - subparams: dict of logical sub-keys for grouped syntax, each with names/type/dest
@@ -18,73 +22,352 @@ CLI_SPEC: List[Dict[str, Any]] = [
     {
         "names": ["--cluster"],
         "action": "store_true",
-        "help": "Group images into clusters based on feature distance threshold.",
+        "help": "Cluster feature vectors and optionally export/save groupings.",
         "tags": ["TaskStarter"],
         "subparams": {
-            "threshold": {"names": ["threshold"], "type": "float", "dest": "cluster_threshold"},
-            "similarity_percent": {"names": ["similarity_percent", "percent"], "type": "float", "dest": "cluster_similarity_percent"},
-            "cluster_min_size": {"names": ["cluster_min_size", "min_size"], "type": "int", "dest": "cluster_min_size"},
-            "cluster_naming_mode": {"names": ["cluster_naming_mode", "naming_mode", "mode"], "type": "str", "dest": "cluster_naming_mode"},
-            "save_discarded": {"names": ["save_discarded"], "type": "bool", "dest": "save_discarded"},
-            "save_mode": {"names": ["save_mode"], "type": "str", "dest": "save_mode"},
-            "algorithm": {"names": ["algorithm", "cluster_algorithm"], "type": "str", "dest": "algorithm"},
-            "cluster_pca": {"names": ["pca", "cluster_pca"], "type": "bool", "dest": "cluster_pca"},
-            "group_filling_size": {"names": ["group_filling_size", "group_size", "x"], "type": "int", "dest": "group_filling_size"},
-            "cluster_splitting_mode": {"names": ["cluster_splitting_mode", "split_mode"], "type": "str", "dest": "cluster_splitting_mode"},
-            "similar_fill": {"names": ["similar_fill", "similar_filling"], "type": "bool", "dest": "cluster_similar_fill"},
+            "threshold": {
+                "names": ["threshold"],
+                "type": "float",
+                "dest": "cluster_threshold",
+                "default": 0.35,
+                "help": "Distance threshold for distance-based algorithms.",
+            },
+            "similarity_percent": {
+                "names": ["similarity_percent", "percent"],
+                "type": "float",
+                "dest": "cluster_similarity_percent",
+                "default": 50.0,
+                "help": "Percent of closest neighbors kept when building similarity graphs.",
+            },
+            "cluster_min_size": {
+                "names": ["cluster_min_size", "min_size"],
+                "type": "int",
+                "dest": "cluster_min_size",
+                "default": 2,
+                "help": "Discard clusters smaller than this size.",
+            },
+            "cluster_naming_mode": {
+                "names": ["cluster_naming_mode", "naming_mode", "mode"],
+                "type": "str",
+                "dest": "cluster_naming_mode",
+                "default": "default",
+                "choices": ["default", "distance", "distance_plus"],
+                "help": "Choose how cluster folders are named.",
+            },
+            "save_discarded": {
+                "names": ["save_discarded"],
+                "type": "bool",
+                "dest": "save_discarded",
+                "default": True,
+                "help": "Store images that were not assigned to any cluster.",
+            },
+            "save_mode": {
+                "names": ["save_mode"],
+                "type": "str",
+                "dest": "save_mode",
+                "default": "default",
+                "choices": ["default", "json", "print", "group_filling"],
+                "help": "Select how to persist clustering results.",
+            },
+            "algorithm": {
+                "names": ["algorithm", "cluster_algorithm"],
+                "type": "str",
+                "dest": "algorithm",
+                "default": "distance",
+                "choices": ["distance", "hdbscan", "dbscan", "cc_graph", "mutual_graph"],
+                "help": "Clustering backend.",
+            },
+            "cluster_pca": {
+                "names": ["pca", "cluster_pca"],
+                "type": "bool",
+                "dest": "cluster_pca",
+                "default": False,
+                "help": "Run PCA/whitening before clustering to denoise features.",
+            },
+            "group_filling_size": {
+                "names": ["group_filling_size", "group_size", "x"],
+                "type": "int",
+                "dest": "group_filling_size",
+                "default": 10,
+                "help": "Target group size when save_mode=group_filling.",
+            },
+            "cluster_splitting_mode": {
+                "names": ["cluster_splitting_mode", "split_mode"],
+                "type": "str",
+                "dest": "cluster_splitting_mode",
+                "default": "recluster",
+                "choices": ["recluster", "fi"],
+                "help": "How to split over-sized groups when filling.",
+            },
+            "similar_fill": {
+                "names": ["similar_fill", "similar_filling"],
+                "type": "bool",
+                "dest": "cluster_similar_fill",
+                "default": False,
+                "help": "Prefer fillers that are closest to the current group centroid.",
+            },
         },
     },
     {
         "names": ["--sorting"],
         "action": "store_true",
-        "help": "Run sorting pipeline.",
+        "help": "Run the MST sorting pipeline to arrange photos.",
         "tags": ["TaskStarter"],
         "subparams": {
-            "lookahead": {"names": ["lookahead"], "type": "int", "dest": "lookahead"},
-            "neighbors_k_limit": {"names": ["neighbors_k_limit"], "type": "int", "dest": "neighbors_k_limit"},
-            "two_opt_shift": {"names": ["two_opt_shift"], "type": "int", "dest": "two_opt_shift"},
-            "two_opt_block_size": {"names": ["two_opt_block_size"], "type": "int", "dest": "two_opt_block_size"},
-            "sort_optimizer": {"names": ["sort_optimizer"], "type": "str", "dest": "sort_optimizer"},
-            "sort_strategy": {"names": ["sort_strategy", "strategy"], "type": "str", "dest": "sort_strategy"},
+            "lookahead": {
+                "names": ["lookahead"],
+                "type": "int",
+                "dest": "lookahead",
+                "default": 100,
+                "help": "DFS lookahead depth for main-component traversal.",
+            },
+            "neighbors_k_limit": {
+                "names": ["neighbors_k_limit"],
+                "type": "int",
+                "dest": "neighbors_k_limit",
+                "default": 1024,
+                "help": "Limit of nearest neighbors kept for MST construction.",
+            },
+            "two_opt_shift": {
+                "names": ["two_opt_shift"],
+                "type": "int",
+                "dest": "two_opt_shift",
+                "default": 90,
+                "help": "Shift window used by the 2-opt local optimizer.",
+            },
+            "two_opt_block_size": {
+                "names": ["two_opt_block_size"],
+                "type": "int",
+                "dest": "two_opt_block_size",
+                "default": 100,
+                "help": "How many nodes are processed per 2-opt block.",
+            },
+            "sort_optimizer": {
+                "names": ["sort_optimizer"],
+                "type": "str",
+                "dest": "sort_optimizer",
+                "default": "2opt",
+                "help": "Local optimizer applied after the main traversal.",
+            },
+            "sort_strategy": {
+                "names": ["sort_strategy", "strategy"],
+                "type": "str",
+                "dest": "sort_strategy",
+                "default": "farthest_insertion",
+                "choices": ["dfs", "farthest_insertion"],
+                "help": "Traversal strategy for the main MST component.",
+            },
         },
     },
     {
         "names": ["--find"],
         "nargs": "?",
         "const": "__PIPE__",
-        "help": "Search mode (optional path or pipeline).",
+        "default": None,
+        "metavar": "[QUERY]",
+        "help": "Search for nearest images (path argument or pipeline input).",
         "tags": ["FinalTaskStarter"],
-        "accept_value": True,
         "subparams": {
-            "batch_size": {"names": ["batch_size"], "type": "int", "dest": "batch_size"},
-            "find_neighbors": {"names": ["find_neighbors", "neighbors", "k"], "type": "int", "dest": "find_neighbors"},
-            "find_result_type": {"names": ["find_result_type", "result_type", "format"], "type": "str", "dest": "find_result_type"},
-            "tsv_neighbors": {"names": ["tsv_neighbors"], "type": "int", "dest": "tsv_neighbors"},
-            "backend": {"names": ["backend"], "type": "str", "dest": "backend"},
-            "query_mode": {"names": ["query_mode", "mode"], "type": "str", "dest": "query_mode"},
-            "fusion_mode": {"names": ["fusion_mode", "fusion"], "type": "str", "dest": "fusion_mode"},
-            "image_weight": {"names": ["image_weight", "w_img"], "type": "float", "dest": "image_weight"},
-            "text_weight": {"names": ["text_weight", "w_txt"], "type": "float", "dest": "text_weight"},
-            "directional_alpha": {"names": ["directional_alpha", "alpha"], "type": "float", "dest": "directional_alpha"},
-            "base_prompt": {"names": ["base_prompt", "base_text"], "type": "str", "dest": "base_prompt"},
+            "batch_size": {
+                "names": ["batch_size"],
+                "type": "int",
+                "dest": "batch_size",
+                "default": 2048,
+                "help": "Batch size for k-NN distance evaluations.",
+            },
+            "find_neighbors": {
+                "names": ["find_neighbors", "neighbors", "k"],
+                "type": "int",
+                "dest": "find_neighbors",
+                "default": 5,
+                "help": "How many neighbors to print for each query.",
+            },
+            "find_result_type": {
+                "names": ["find_result_type", "result_type", "format"],
+                "type": "str",
+                "dest": "find_result_type",
+                "default": "both",
+                "choices": ["indexed", "path", "both"],
+                "help": "Output style: FAISS positions, filesystem paths, or both.",
+            },
+            "tsv_neighbors": {
+                "names": ["tsv_neighbors"],
+                "type": "int",
+                "dest": "tsv_neighbors",
+                "default": 5,
+                "help": "Neighbors per row when exporting TSV summaries.",
+            },
+            "backend": {
+                "names": ["backend"],
+                "type": "str",
+                "dest": "backend",
+                "default": "auto",
+                "choices": ["auto", "regnet", "clip"],
+                "help": "Force the embedding backend (auto picks based on model).",
+            },
+            "query_mode": {
+                "names": ["query_mode", "mode"],
+                "type": "str",
+                "dest": "query_mode",
+                "default": "image",
+                "choices": ["image", "text", "image+text"],
+                "help": "Type of query consumed by --find.",
+            },
+            "fusion_mode": {
+                "names": ["fusion_mode", "fusion"],
+                "type": "str",
+                "dest": "fusion_mode",
+                "default": "simple",
+                "choices": ["simple", "directional"],
+                "help": "How image/text embeddings are fused in image+text mode.",
+            },
+            "image_weight": {
+                "names": ["image_weight", "w_img"],
+                "type": "float",
+                "dest": "image_weight",
+                "default": 0.5,
+                "help": "Weight of the image branch for fusion queries.",
+            },
+            "text_weight": {
+                "names": ["text_weight", "w_txt"],
+                "type": "float",
+                "dest": "text_weight",
+                "default": 0.5,
+                "help": "Weight of the text branch for fusion queries.",
+            },
+            "directional_alpha": {
+                "names": ["directional_alpha", "alpha"],
+                "type": "float",
+                "dest": "directional_alpha",
+                "default": 0.7,
+                "help": "Alpha used by directional fusion mode.",
+            },
+            "base_prompt": {
+                "names": ["base_prompt", "base_text"],
+                "type": "str",
+                "dest": "base_prompt",
+                "default": "a photo on a road",
+                "help": "Default textual hint for directional CLIP queries.",
+            },
         },
     },
     # Files / model / misc / db
-    {"names": ["-m", "--model", "--model_name"], "type": str, "help": "Model name.", "tags": ["Param"]},
-    {"names": ["--more_scan"], "action": "store_true", "help": "Extended input scan.", "tags": ["Param"]},
-    {"names": ["--feature_workers"], "type": int, "help": "Workers for feature extraction.", "tags": ["Param"]},
-    {"names": ["--image_batch_size"], "type": int, "help": "Batch size for feature extraction.", "tags": ["Param"]},
-    {"names": ["--input", "--input_folder", "-i"], "type": str, "help": "Input folder.", "tags": ["Param"]},
-    {"names": ["--output", "--output_folder", "-o"], "type": str, "help": "Output folder.", "tags": ["Param"]},
-    {"names": ["--index_file"], "type": str, "help": "FAISS index file.", "tags": ["Param"]},
-    {"names": ["--out_tsv"], "type": str, "help": "Neighbors TSV output.", "tags": ["Param"]},
-    {"names": ["--use_cpu", "--cpu"], "action": "store_true", "help": "Force CPU.", "tags": ["Param"]},
-    {"names": ["--loglevel"], "type": str, "choices": ["default", "error", "quiet", "debug"], "help": "Log level.", "tags": ["Param"]},
-    {"names": ["--list_objects"], "action": "store_true", "help": "List DB file paths.", "tags": ["Task"]},
-    {"names": ["--move_db"], "type": str, "nargs": 2, "help": "Move DB entries OLD_ROOT NEW_ROOT.", "tags": ["Task"]},
-    {"names": ["--print_params"], "type": str, "choices": ["all", "entered"], "help": "Print parameters before run.", "tags": ["Param"]},
-    {"names": ["--list_only"], "action": "store_true", "tags": ["Param"]},
-    {"names": ["--query_text"], "type": str, "help": "Text prompt for text or image+text queries.", "tags": ["Param"]}
+    {
+        "names": ["-m", "--model", "--model_name"],
+        "type": str,
+        "default": "clip_vit_liaon",
+        "metavar": "MODEL",
+        "help": "Backbone used for feature extraction (see Supported models section).",
+        "tags": ["Param"],
+    },
+    {
+        "names": ["--more_scan"],
+        "action": "store_true",
+        "default": False,
+        "help": "Rescan folders recursively to discover additional files before processing.",
+        "tags": ["Param"],
+    },
+    {
+        "names": ["--feature_workers"],
+        "type": int,
+        "default": DEFAULT_FEATURE_WORKERS,
+        "metavar": "N",
+        "help": "How many worker processes are used while encoding features.",
+        "tags": ["Param"],
+    },
+    {
+        "names": ["--image_batch_size"],
+        "type": int,
+        "default": 1024,
+        "metavar": "BATCH",
+        "help": "Mini-batch size for the feature extractor.",
+        "tags": ["Param"],
+    },
+    {
+        "names": ["--input", "--input_folder", "-i"],
+        "type": str,
+        "default": "input_images",
+        "metavar": "DIR",
+        "help": "Folder with unsorted images that will be processed.",
+        "tags": ["Param"],
+    },
+    {
+        "names": ["--output", "--output_folder", "-o"],
+        "type": str,
+        "default": "sorted_images",
+        "metavar": "DIR",
+        "help": "Folder where sorted images (or lists) will be written.",
+        "tags": ["Param"],
+    },
+    {
+        "names": ["--index_file"],
+        "type": str,
+        "default": "faiss.index",
+        "metavar": "PATH",
+        "help": "FAISS index path used for clustering/search.",
+        "tags": ["Param"],
+    },
+    {
+        "names": ["--out_tsv"],
+        "type": str,
+        "default": "neighbor_list.tsv",
+        "metavar": "PATH",
+        "help": "Where to store neighbor summaries in TSV format.",
+        "tags": ["Param"],
+    },
+    {
+        "names": ["--use_cpu", "--cpu"],
+        "action": "store_true",
+        "default": False,
+        "help": "Force CPU execution even if a GPU is visible.",
+        "tags": ["Param"],
+    },
+    {
+        "names": ["--loglevel"],
+        "type": str,
+        "default": "default",
+        "choices": ["default", "error", "quiet", "debug"],
+        "metavar": "LEVEL",
+        "help": "Verbosity level for console logging.",
+        "tags": ["Param"],
+    },
+    {
+        "names": ["--list_objects"],
+        "action": "store_true",
+        "default": False,
+        "help": "Print every file path stored in the SQLite feature DB.",
+        "tags": ["Task"],
+    },
+    {
+        "names": ["--move_db"],
+        "type": str,
+        "nargs": 2,
+        "metavar": ("OLD_ROOT", "NEW_ROOT"),
+        "help": "Rewrite database paths by replacing OLD_ROOT with NEW_ROOT.",
+        "tags": ["Task"],
+    },
+    {
+        "names": ["--print_params"],
+        "type": str,
+        "choices": ["all", "entered"],
+        "metavar": "MODE",
+        "help": "Dump effective parameters (all) or only values provided via CLI (entered).",
+        "tags": ["Param"],
+    },
+    {
+        "names": ["--list_only"],
+        "action": "store_true",
+        "default": False,
+        "help": "Skip file system writes and only print the operations that would run.",
+        "tags": ["Param"],
+    },
+    {
+        "names": ["--query_text"],
+        "type": str,
+        "metavar": "TEXT",
+        "help": "Inline text used by --find text/image+text modes.",
+        "tags": ["Param"],
+    },
 ]
 
 
@@ -117,6 +400,10 @@ def _build_help_epilog() -> str:
 PARSER_EPILOG = _build_help_epilog()
 
 
+class NeusortHelpFormatter(argparse.ArgumentDefaultsHelpFormatter, argparse.RawTextHelpFormatter):
+    """Allow multiline help text while also appending default values automatically."""
+
+
 def _first_long_name(names: List[str]) -> str:
     for n in names:
         if n.startswith("--"):
@@ -129,6 +416,7 @@ TOP_NAME_TO_SPEC: Dict[str, Dict[str, Any]] = {}
 CLI_TOP_SPECS: List[Dict[str, Any]] = []
 PARENT_SUBPARAM_MAP: Dict[str, Dict[str, Tuple[str, str]]] = {}
 PARENT_VALUE_DEST: Dict[str, str] = {}
+DEFAULT_GROUPED_VALUES: Dict[str, Any] = {}
 
 
 def _arg_dest_from_names(names: List[str]) -> str:
@@ -139,6 +427,27 @@ def _arg_dest_from_names(names: List[str]) -> str:
     else:
         base = names[0].lstrip("-")
     return base.replace("-", "_")
+
+def _format_subparam_help(subparams: Dict[str, Dict[str, Any]]) -> str:
+    lines = []
+    for item in subparams.values():
+        alias = ", ".join(item["names"])
+        parts = [f"  {alias}: {item['help']}"]
+        if item.get("choices"):
+            parts.append(f"Choices: {', '.join(item['choices'])}.")
+        if "default" in item:
+            parts.append(f"Default: {item['default']}.")
+        lines.append(" ".join(parts))
+    return "\nSub-parameters:\n" + "\n".join(lines)
+
+
+def _subparam_dotted_key(parent_flag: str, dest: str) -> str:
+    parent_key = parent_flag.lstrip("-")
+    subname = dest
+    if subname.startswith(parent_key + "_"):
+        subname = subname[len(parent_key) + 1 :]
+    return f"{parent_key}.{subname}"
+
 
 for spec in CLI_SPEC:
     # record top-level names
@@ -155,6 +464,9 @@ for spec in CLI_SPEC:
             typ = s.get("type", "str")
             for alias in s["names"]:
                 submap[alias.lower()] = (dest, typ)
+            dotted = _subparam_dotted_key(parent, dest)
+            if "default" in s:
+                DEFAULT_GROUPED_VALUES[dotted] = s["default"]
         PARENT_SUBPARAM_MAP[parent] = submap
         PARENT_VALUE_DEST[parent] = _arg_dest_from_names(spec["names"])
 
@@ -219,26 +531,25 @@ def _apply_group(parent_flag: str, group_token: str, args: argparse.Namespace) -
         else:
             val = v
         # record dotted for reporting
-        parent_key = parent_flag.lstrip('-')
-        subname = dest
-        if subname.startswith(parent_key + "_"):
-            subname = subname[len(parent_key) + 1 :]
-        updates[f"{parent_key}.{subname}"] = val
+        updates[_subparam_dotted_key(parent_flag, dest)] = val
     return updates
 
 
 # Build parser from top-level specs (SubParams are not added to argparse)
 parser = argparse.ArgumentParser(
     description="Neusort CLI",
-    formatter_class=argparse.RawDescriptionHelpFormatter,
+    formatter_class=NeusortHelpFormatter,
     epilog=PARSER_EPILOG,
 )
 
 for spec in CLI_TOP_SPECS:
     names = spec["names"]
     kwargs: Dict[str, Any] = {}
-    if "help" in spec:
-        kwargs["help"] = spec["help"]
+    help_text = spec.get("help")
+    if help_text and spec.get("subparams"):
+        help_text = help_text.rstrip() + "\n" + _format_subparam_help(spec["subparams"])
+    if help_text:
+        kwargs["help"] = help_text
     if "action" in spec:
         kwargs["action"] = spec["action"]
     if "type" in spec:
@@ -251,6 +562,8 @@ for spec in CLI_TOP_SPECS:
         kwargs["choices"] = spec["choices"]
     if "metavar" in spec:
         kwargs["metavar"] = spec["metavar"]
+    if "default" in spec:
+        kwargs["default"] = spec["default"]
     parser.add_argument(*names, **kwargs)
 
 
@@ -342,9 +655,12 @@ ENTERED_PARAMS = _collect_entered_params(raw_cli_args)
 LOGGER = CustomLogger(level=LogLevel(getattr(args, "loglevel", None) or "default"))
 set_model_logger(LOGGER)
 set_model_factory_runtime(logger=LOGGER)
+# Merge grouped defaults declared in CLI_SPEC with user-provided overrides
+EFFECTIVE_GROUPED: Dict[str, Any] = dict(DEFAULT_GROUPED_VALUES)
+EFFECTIVE_GROUPED.update(ENTERED_GROUPED)
 # Pass grouped sub-params separately to Config so that subparam namespaces
 # remain isolated per parent flag and are not read from argparse attrs.
-CONFIG = Config(args, ENTERED_GROUPED)
+CONFIG = Config(args, EFFECTIVE_GROUPED)
 
 
 if CONFIG.model.use_cpu:
@@ -382,7 +698,7 @@ Schema Structure (CLI_SPEC)
       Task            -> Lightweight task (can be repeated)
       TaskStarter     -> Starts a pipeline task (e.g., sorting, clustering)
       FinalTaskStarter-> Must run last; if multiple, only the first is kept
-      NonTerminal     -> Internal (not exposed; usually defaults live in code)
+      NonTerminal     -> Internal (not exposed; defaults live in code if needed)
   - action|type|nargs|choices|const|metavar — standard argparse options for
     top-level argument behavior.
   - subparams: dict[str, SubSpec] (optional) — keyed by a logical name; each SubSpec is:
@@ -420,7 +736,8 @@ Adding a New Parameter
      - dest: args attribute to set (ensure Config reads this attribute)
 3) Update Config if needed
    - Keep Config attribute names stable; set 'dest' to match what Config expects.
-   - Defaults should live in Config (not in CLI_SPEC) to avoid duplication.
+   - Declare defaults inside CLI_SPEC so --help stays truthful; Config receives
+     merged default + user values via the grouped map.
 
 Validation and Printing
 - --print_params entered: prints grouped dotted keys (parent.subkey=value) and top-level
@@ -485,6 +802,13 @@ if getattr(args, "print_params", None) in ("all", "entered"):
                             cfg_attr = 'pca_enabled'
                         elif subname == 'splitting_mode':
                             cfg_attr = 'cluster_splitting_mode'
+                    elif parent_key == 'sorting':
+                        if subname == 'sort_optimizer':
+                            cfg_attr = 'optimizer'
+                        elif subname == 'sort_strategy':
+                            cfg_attr = 'strategy'
+                    elif parent_key == 'find' and subname == 'batch_size':
+                        cfg_attr = 'global_knn_batch_size'
                     v = getattr(cfg_obj, cfg_attr, None)
                     key = f"{parent_key}.{subname}"
                     if key in printed:

@@ -808,35 +808,55 @@ def _compute_cluster_cli(
 
 
 def _candidate_starts_for_cluster(desired: int, length: int, current_len: int, group_size: int) -> List[int]:
+    """
+    Generate candidate insertion indices based on group alignment rules.
+    
+    - If size < group_size: Candidates must fit entirely within a single group. 
+      We check the groups that 'desired' touches or is adjacent to.
+    - If size >= group_size: We check the range covering the groups the cluster would 
+      occupy at 'desired', allowing shifts from edge to edge of those groups.
+    """
+    # Always include the exact desired position (clamped) as a fallback/baseline
+    candidates = {max(0, min(desired, current_len))}
+    
     if group_size <= 0:
-        return [min(desired, current_len)]
+        return sorted(list(candidates))
 
-    candidates: set[int] = set()
-    if length <= group_size:
-        groups = {desired // group_size, (desired + length - 1) // group_size}
-        for g in groups:
-            start_min = g * group_size
-            start_max = g * group_size + group_size - length
-            if start_max < start_min:
-                start_max = start_min
-            for s in range(start_min, start_max + 1):
-                s_clamped = min(max(0, s), current_len)
-                candidates.add(s_clamped)
-    else:
-        g_start = desired // group_size
-        g_end = (desired + length - 1) // group_size
-        start_min = g_start * group_size
-        start_max = (g_end + 1) * group_size - length
-        if start_max < start_min:
-            start_max = start_min
-        for s in range(start_min, start_max + 1):
-            s_clamped = min(max(0, s), current_len)
-            candidates.add(s_clamped)
+    # Identify the range of groups we are interested in
+    # We look at the group where 'desired' starts, and where 'desired + length' ends.
+    start_g = desired // group_size
+    end_g = (desired + length) // group_size
+    
+    # We broaden the search slightly to ensure we check adjacent group options 
+    # if we are near a boundary
+    groups_to_check = range(max(0, start_g - 1), end_g + 2)
 
-    if not candidates:
-        candidates.add(min(desired, current_len))
-    return sorted(candidates)
+    for g in groups_to_check:
+        g_start = g * group_size
+        g_end = g_start + group_size
+        
+        if length < group_size:
+            # Constaint: Cluster must be strictly inside [g_start, g_end]
+            # Max start index is g_end - length
+            valid_start_min = g_start
+            valid_start_max = g_end - length
+        else:
+            # Constraint: Cluster spans multiple groups.
+            # We allow starting anywhere in this group context, effectively sliding 
+            # the large cluster through this group frame.
+            valid_start_min = g_start
+            valid_start_max = g_end # We can start even at the very end of this group
+            
+        # Validate bounds against logic
+        if valid_start_max < valid_start_min:
+            continue
+            
+        # Generate range, clamping to actual sequence length
+        for s in range(valid_start_min, valid_start_max + 1):
+            if 0 <= s <= current_len:
+                candidates.add(s)
 
+    return sorted(list(candidates))
 
 def _placement_cost(
     seq: List[int],
@@ -848,28 +868,65 @@ def _placement_cost(
     use_centroid: bool,
     centroid: np.ndarray,
 ) -> float:
+    # 1. Base distance cost (neighbors)
     left = seq[start - 1] if start > 0 else None
     right = seq[start] if start < len(seq) else None
     cost = _cluster_neighbor_cost(orient, left, right, feats, use_centroid, centroid)
 
-    if group_size > 0 and len(orient) > group_size:
-        rem = len(orient) % group_size
-        if rem == 0 and start % group_size == 0:
-            cost -= 0.2
-        elif rem < group_size / 2:
-            left_partial = group_size - (start % group_size) if (start % group_size) != 0 else group_size
-            left_partial = min(left_partial, len(orient))
-            remaining = len(orient) - left_partial
-            if remaining > 0:
-                right_partial = remaining % group_size
-                right_partial = right_partial if right_partial != 0 else group_size
-            else:
-                right_partial = left_partial
-            penalty = ((left_partial - right_partial) ** 2) / 150.0 - 0.16
-            penalty = min(1.0, max(0.0, penalty))
-            cost += penalty
+    # 2. Group alignment penalties/bonuses
+    if group_size > 0:
+        length = len(orient)
+        
+        if length > group_size:
+            # Logic for Large Clusters
+            rem = length % group_size
+            
+            # Case A: Size is multiple of group_size
+            if rem == 0:
+                # Bonus for aligning to grid
+                if start % group_size == 0:
+                    cost -= 0.2
+            
+            # Case B: Remainder > half group_size
+            # Spec: "Just slide left/right with normal priorities" -> No special penalty added
+            
+            # Case C: Remainder <= half group_size
+            # Spec: Prioritize balanced tails (e.g. 5+10+6 > 1+10+10)
+            elif rem <= group_size / 2:
+                # Calculate Left Group Partial (items in the first group)
+                # If start is 12 (group 10-19), items are 12..19 -> 8 items.
+                offset_in_group = start % group_size
+                left_partial = group_size - offset_in_group
+                # Verify left_partial isn't larger than total length (shouldn't happen here but safe)
+                left_partial = min(left_partial, length)
+                
+                remaining = length - left_partial
+                
+                # Calculate Right Group Partial (items in the last group)
+                if remaining > 0:
+                    right_partial = remaining % group_size
+                    # If modulo is 0, it means it fills the last group completely? 
+                    # No, rem <= half.
+                    # Example: Len 21, Start 12 (group 10).
+                    # Left=8 (12-19). Rem=13. 
+                    # Next group (20-29) takes 10. Rem=3.
+                    # Last group takes 3. right_partial=3.
+                    if right_partial == 0 and remaining >= group_size:
+                         # It ended exactly on boundary
+                         right_partial = group_size
+                else:
+                    right_partial = 0 # Should not happen if length > group size
+                
+                # Formula: base + clamp(((L-R)^2)/150 - 0.16, 0.0, 1.0)
+                diff = left_partial - right_partial
+                penalty = ((diff ** 2) / 150.0) - 0.16
+                penalty = max(0.0, min(1.0, penalty))
+                cost += penalty
 
+    # 3. Distance from desired position penalty (to avoid drifting too far)
+    # Using a small weight to break ties in favor of the intended position
     cost += 0.0005 * abs(start - desired)
+    
     return cost
 
 
@@ -973,89 +1030,104 @@ def _export_cluster_sort(
         for idx in cl:
             cluster_id_map[int(idx)] = int(cid)
 
-    # Внутренняя сортировка всех кластеров
+    # 1. Internal sorting of clusters
     prepared: List[List[int]] = []
     for cl in result.clusters:
         ordered = _order_cluster_items(list(cl), feats, config)
         prepared.append(ordered)
 
-    # Order discarded (noise) as base chain
+    # 2. Internal sorting of discarded (base sequence)
     base_seq = _order_discarded(list(result.discarded), feats, config)
     feats_cache = feats.astype(np.float32, copy=False)
 
-    # Compute best insertion pos/orientation on base_seq (without mutation)
+    # 3. Calculate CLi (Optimal insertion index) for each cluster against the base sequence
+    #    We do this BEFORE any insertions.
     cluster_structs = []
     for pid, cl in enumerate(prepared):
         items = list(cl)
+        # Find best spot in the *original* base_seq
         best_pos, best_oriented, best_cost, centroid = _compute_cluster_cli(items, base_seq, feats_cache, use_centroid)
         cluster_structs.append(
             {
                 "pid": pid,
                 "items": best_oriented,
-                "best_pos": best_pos,
+                "best_pos": best_pos, # Target index relative to base_seq
                 "best_cost": best_cost,
                 "orig_size": len(items),
                 "centroid": centroid,
             }
         )
 
-    # Sort clusters by CLi (then cost)
+    # Sort clusters by their target insertion index (CLi)
     cluster_structs.sort(key=lambda c: (c["best_pos"], c["best_cost"]))
 
-    # Start from ordered discarded list and insert clusters one by one (shifting positions)
+    # 4. Insertion Phase
     seq: List[int] = list(base_seq)
-    spans: List[Tuple[int, int, int]] = []
-    offset = 0
+    
+    # We maintain a list of mutable cluster objects because we need to update 
+    # their 'best_pos' dynamically as we insert chunks into the sequence.
+    # Since we need to pop and shift, using a list as a queue.
+    queue = cluster_structs
+    
+    processed_spans: List[Tuple[int, int, int]] = []
 
-    for cl in cluster_structs:
-        desired = int(min(cl["best_pos"] + offset, len(seq)))
+    while queue:
+        cl = queue.pop(0)
+        
+        # The 'best_pos' in cl is now relative to the *current* state of 'seq' 
+        # (because we update remaining items after every insertion)
+        desired = max(0, min(cl["best_pos"], len(seq)))
+        length = len(cl["items"])
 
-        best_start = None
+        best_start = desired
         best_orient = cl["items"]
         best_cost_place = float("inf")
-        candidates = _candidate_starts_for_cluster(desired, len(cl["items"]), len(seq), group_size)
+        
+        # Generate candidates: logic handles "fit in group" or "slide in group"
+        candidates = _candidate_starts_for_cluster(desired, length, len(seq), group_size)
+        
         for start in candidates:
+            # Check both orientations
             for orient in (cl["items"], list(reversed(cl["items"]))):
                 cost = _placement_cost(seq, start, orient, feats_cache, group_size, desired, use_centroid, cl["centroid"])
+                
+                # Tie-breaking: lower cost, then closer to desired
                 if cost < best_cost_place:
                     best_cost_place = cost
                     best_start = start
                     best_orient = orient
-                elif cost == best_cost_place and best_start is not None and abs(start - desired) < abs(best_start - desired):
-                    best_start = start
-                    best_orient = orient
-        if best_start is None:
-            best_start = len(seq)
+                elif cost == best_cost_place:
+                    if abs(start - desired) < abs(best_start - desired):
+                        best_start = start
+                        best_orient = orient
+        
+        # Perform Insertion
+        # Insert best_orient into seq at best_start
         seq[best_start:best_start] = best_orient
-        offset += len(best_orient)
-        spans.append((cl["pid"], best_start, best_start + len(best_orient) - 1))
+        
+        processed_spans.append((cl["pid"], best_start, best_start + length - 1))
+        
         LOGGER.debug(
-            f"[cluster_sort] insert pid={cl['pid']} size={len(best_orient)} orig_size={cl['orig_size']} "
-            f"best_pos={cl['best_pos']} cost={cl['best_cost']:.4f} insert_at={best_start} "
-            f"group={best_start//group_size if group_size>0 else 0}"
+            f"[cluster_sort] pid={cl['pid']} target={desired} -> inserted_at={best_start} "
+            f"(cost={best_cost_place:.4f})"
         )
 
-    for pid, start, end in spans:
+        # 5. Dynamic Update of Subsequent Clusters (CLi Shift)
+        # Rule: If we inserted at 'best_start', any target index >= 'best_start' 
+        # effectively moves to the right by 'length'.
+        # Note: If a cluster target was *before* best_start, it is unaffected.
+        for other in queue:
+            if other["best_pos"] >= best_start:
+                other["best_pos"] += length
+
+    # Logging checks for debug
+    for pid, start, end in processed_spans:
         LOGGER.debug(f"[cluster_sort] span pid={pid} start={start} end={end} len={end-start+1}")
-
-    pos_by_cid: Dict[int, List[int]] = {}
-    for pos, idx in enumerate(seq):
-        cid = int(cluster_id_map.get(int(idx), 0))
-        if cid > 0:
-            pos_by_cid.setdefault(cid, []).append(pos)
-
-    for cid, positions in pos_by_cid.items():
-        positions.sort()
-        span_len = positions[-1] - positions[0] + 1
-        if span_len != len(positions):
-            LOGGER.debug(
-                f"[cluster_sort] non-contiguous cluster_id={cid}: size={len(positions)} span={span_len} "
-                f"positions(sample)={positions[:5]}...{positions[-5:] if len(positions)>5 else positions}"
-            )
 
     if not config.misc.list_only:
         names = _build_sequence_names(seq, feats, paths, cluster_id_map, naming_mode)
         _copy_with_custom_names(paths, seq, names, base_dir, config)
+    
     LOGGER.info(
         f"Cluster-sort output saved to: {base_dir} "
         f"(groupsize={group_size}, use_centroid={'yes' if use_centroid else 'no'})."

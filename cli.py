@@ -160,6 +160,12 @@ CLI_SPEC: List[Dict[str, Any]] = [
         },
     },
     {
+        "names": ["--index_only"],
+        "action": "store_true",
+        "help": "Only compute/cache features (build the index) and exit; skips sorting/clustering/search.",
+        "tags": ["TaskStarter"],
+    },
+    {
         "names": ["--find"],
         "nargs": "?",
         "const": "__PIPE__",

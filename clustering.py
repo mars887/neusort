@@ -17,7 +17,7 @@ from tqdm.auto import tqdm
 from cli import LOGGER
 from config import Config
 from utils import copy_and_rename
-from sorting import farthest_insertion_path
+from sorting import farthest_insertion_path, farthest_insertion_path_clustered
 
 
 @dataclass
@@ -229,15 +229,17 @@ def _build_neighbor_sets(feats: np.ndarray, threshold: float, use_gpu: bool) -> 
         return [set() for _ in range(n)]
 
     feats32 = feats.astype(np.float32, copy=False)
-    index = faiss.IndexFlatL2(d)
+    index_cpu = faiss.IndexFlatL2(d)
+    index_cpu.add(feats32)
+    index = index_cpu
     if use_gpu:
         try:
             resources = faiss.StandardGpuResources()
-            index = faiss.index_cpu_to_gpu(resources, 0, index)
+            index_gpu = faiss.index_cpu_to_gpu(resources, 0, index_cpu)
+            index = index_gpu
         except Exception as exc:
             LOGGER.info(f"Falling back to CPU FAISS for clustering: {exc}")
 
-    index.add(feats32)
     radius = float(threshold) ** 2
     try:
         lims, _, labels = index.range_search(feats32, radius)
@@ -248,6 +250,27 @@ def _build_neighbor_sets(feats: np.ndarray, threshold: float, use_gpu: bool) -> 
         index.range_search(feats32, radius, result)
         lims = faiss.vector_to_array(result.lims).astype(np.int64, copy=False)
         labels = faiss.vector_to_array(result.labels).astype(np.int64, copy=False)
+    except Exception as exc:
+        LOGGER.info(f"Range search not available on this FAISS build (using CPU manual fallback): {exc}")
+        # Manual CPU fallback: chunked distance computation
+        neighbors = [set() for _ in range(n)]
+        all_sq = np.sum(feats32.astype(np.float32, copy=False) ** 2.0, axis=1)
+        chunk = max(64, min(1024, n))
+        for start in range(0, n, chunk):
+            end = min(n, start + chunk)
+            block = feats32[start:end]
+            block_sq = all_sq[start:end]
+            # distance^2 = ||a||^2 + ||b||^2 - 2 a·b
+            d2 = block_sq[:, None] + all_sq[None, :] - 2.0 * (block @ feats32.T)
+            np.maximum(d2, 0.0, out=d2)
+            within = d2 <= radius
+            for i_local, row in enumerate(within):
+                i_global = start + i_local
+                js = np.where(row)[0]
+                for j in js:
+                    if j != i_global:
+                        neighbors[i_global].add(int(j))
+        return neighbors
 
     neighbors: List[set] = []
     for i in range(n):
@@ -649,7 +672,7 @@ def cluster_by_mutual_graph(feats: np.ndarray, config: Config, use_gpu: bool) ->
 
 def _resolve_save_mode(config: Config) -> str:
     raw_mode = str(getattr(config.clustering, "save_mode", "default")).lower()
-    if raw_mode not in {"default", "json", "print", "group_filling"}:
+    if raw_mode not in {"default", "json", "print", "group_filling", "cluster_sort"}:
         return "default"
     return raw_mode
 
@@ -679,6 +702,7 @@ def _export_group_filling(
         split_mode = "recluster"
 
     prepared = _prepare_group_filling_clusters(result.clusters, feats, config, group_size, split_mode)
+    prepared = _sort_clusters_by_embedding(prepared, feats, config)
 
     all_discards = list(result.discarded if save_discarded else [])
     groups_seq_order = _build_cluster_groups(prepared, group_size, by_size_desc=False)
@@ -715,6 +739,330 @@ def _export_group_filling(
     return base_dir, len(result.clusters), len(result.discarded)
 
 
+def _order_discarded(discarded: List[int], feats: np.ndarray, config: Config) -> List[int]:
+    if not discarded:
+        return []
+    sub_feats = feats[np.array(discarded, dtype=int)]
+    order_local = farthest_insertion_path_clustered(sub_feats, config, show_progress=False)
+    return [discarded[int(i)] for i in order_local]
+
+
+def _cluster_embedding(cluster: List[int], feats: np.ndarray) -> np.ndarray:
+    if not cluster:
+        return np.zeros((feats.shape[1],), dtype=np.float32)
+    return np.mean(feats[np.array(cluster, dtype=int)].astype(np.float32, copy=False), axis=0)
+
+
+def _order_cluster_items(cluster: List[int], feats: np.ndarray, config: Config) -> List[int]:
+    if len(cluster) <= 1:
+        return list(cluster)
+    sub_feats = feats[np.array(cluster, dtype=int)]
+    local_order = farthest_insertion_path(sub_feats, config, show_progress=False)
+    return [cluster[int(i)] for i in local_order]
+
+
+def _cluster_neighbor_cost(
+    orient: List[int],
+    left_idx: Optional[int],
+    right_idx: Optional[int],
+    feats: np.ndarray,
+    use_centroid: bool,
+    centroid: Optional[np.ndarray] = None,
+) -> float:
+    if not orient:
+        return 0.0
+    left_vec = centroid if use_centroid and centroid is not None else feats[int(orient[0])]
+    right_vec = centroid if use_centroid and centroid is not None else feats[int(orient[-1])]
+
+    cost = 0.0
+    if left_idx is not None:
+        cost += float(np.linalg.norm(feats[int(left_idx)] - left_vec))
+    if right_idx is not None:
+        cost += float(np.linalg.norm(right_vec - feats[int(right_idx)]))
+    if left_idx is not None and right_idx is not None:
+        cost -= float(np.linalg.norm(feats[int(left_idx)] - feats[int(right_idx)]))
+    return cost
+
+
+def _compute_cluster_cli(
+    items: List[int],
+    base_seq: List[int],
+    feats: np.ndarray,
+    use_centroid: bool,
+) -> Tuple[int, List[int], float, np.ndarray]:
+    base_len = len(base_seq)
+    centroid = _cluster_embedding(items, feats)
+    best_pos = 0
+    best_cost = float("inf")
+    best_orient = items
+    for pos in range(base_len + 1):
+        left = base_seq[pos - 1] if pos > 0 else None
+        right = base_seq[pos] if pos < base_len else None
+        for orient in (items, list(reversed(items))):
+            cost = _cluster_neighbor_cost(orient, left, right, feats, use_centroid, centroid)
+            if cost < best_cost:
+                best_cost = cost
+                best_pos = pos
+                best_orient = orient
+    return best_pos, best_orient, best_cost, centroid
+
+
+def _candidate_starts_for_cluster(desired: int, length: int, current_len: int, group_size: int) -> List[int]:
+    if group_size <= 0:
+        return [min(desired, current_len)]
+
+    candidates: set[int] = set()
+    if length <= group_size:
+        groups = {desired // group_size, (desired + length - 1) // group_size}
+        for g in groups:
+            start_min = g * group_size
+            start_max = g * group_size + group_size - length
+            if start_max < start_min:
+                start_max = start_min
+            for s in range(start_min, start_max + 1):
+                s_clamped = min(max(0, s), current_len)
+                candidates.add(s_clamped)
+    else:
+        g_start = desired // group_size
+        g_end = (desired + length - 1) // group_size
+        start_min = g_start * group_size
+        start_max = (g_end + 1) * group_size - length
+        if start_max < start_min:
+            start_max = start_min
+        for s in range(start_min, start_max + 1):
+            s_clamped = min(max(0, s), current_len)
+            candidates.add(s_clamped)
+
+    if not candidates:
+        candidates.add(min(desired, current_len))
+    return sorted(candidates)
+
+
+def _placement_cost(
+    seq: List[int],
+    start: int,
+    orient: List[int],
+    feats: np.ndarray,
+    group_size: int,
+    desired: int,
+    use_centroid: bool,
+    centroid: np.ndarray,
+) -> float:
+    left = seq[start - 1] if start > 0 else None
+    right = seq[start] if start < len(seq) else None
+    cost = _cluster_neighbor_cost(orient, left, right, feats, use_centroid, centroid)
+
+    if group_size > 0 and len(orient) > group_size:
+        rem = len(orient) % group_size
+        if rem == 0 and start % group_size == 0:
+            cost -= 0.2
+        elif rem < group_size / 2:
+            left_partial = group_size - (start % group_size) if (start % group_size) != 0 else group_size
+            left_partial = min(left_partial, len(orient))
+            remaining = len(orient) - left_partial
+            if remaining > 0:
+                right_partial = remaining % group_size
+                right_partial = right_partial if right_partial != 0 else group_size
+            else:
+                right_partial = left_partial
+            penalty = ((left_partial - right_partial) ** 2) / 150.0 - 0.16
+            penalty = min(1.0, max(0.0, penalty))
+            cost += penalty
+
+    cost += 0.0005 * abs(start - desired)
+    return cost
+
+
+def _best_insertion_pos(seq: List[int], emb: np.ndarray, feats: np.ndarray) -> Tuple[int, float]:
+    best_cost = float("inf")
+    best_pos = 0
+    n = len(seq)
+    for pos in range(n + 1):
+        left_idx = seq[pos - 1] if pos > 0 else None
+        right_idx = seq[pos] if pos < n else None
+        cost = 0.0
+        if left_idx is not None:
+            cost += float(np.linalg.norm(feats[left_idx] - emb))
+        if right_idx is not None:
+            cost += float(np.linalg.norm(feats[right_idx] - emb))
+        if left_idx is not None and right_idx is not None:
+            cost -= float(np.linalg.norm(feats[left_idx] - feats[right_idx]))
+        if cost < best_cost:
+            best_cost = cost
+            best_pos = pos
+    return best_pos, best_cost
+
+
+def _orient_cluster_for_neighbors(order: List[int], feats: np.ndarray, left_idx: Optional[int], right_idx: Optional[int]) -> List[int]:
+    if len(order) <= 1:
+        return order
+    first, last = order[0], order[-1]
+    cost_forward = 0.0
+    cost_reverse = 0.0
+    if left_idx is not None:
+        cost_forward += float(np.linalg.norm(feats[left_idx] - feats[first]))
+        cost_reverse += float(np.linalg.norm(feats[left_idx] - feats[last]))
+    if right_idx is not None:
+        cost_forward += float(np.linalg.norm(feats[last] - feats[right_idx]))
+        cost_reverse += float(np.linalg.norm(feats[first] - feats[right_idx]))
+    return order if cost_forward <= cost_reverse else list(reversed(order))
+
+
+def _clamp_to_group(idx: int, length: int, group_size: int, total_len: int) -> int:
+    if group_size <= 0:
+        return max(0, min(idx, total_len))
+    group_start = (idx // group_size) * group_size
+    lower = group_start
+    upper = max(group_start, group_start + group_size - length)
+    if upper < lower:
+        upper = lower
+    clamped = idx
+    if clamped < lower:
+        clamped = lower
+    if clamped > upper:
+        clamped = upper
+    clamped = max(0, min(clamped, total_len))
+    return clamped
+
+
+def _build_sequence_names(
+    sequence: List[int],
+    feats: np.ndarray,
+    paths: Sequence[str],
+    cluster_id_map: Dict[int, int],
+    naming_mode: str,
+) -> List[str]:
+    total = len(sequence)
+    num_digits = len(str(total - 1)) if total > 0 else 1
+    fmt = f"{{:0{num_digits}d}}"
+    names: List[str] = []
+    for i, idx in enumerate(sequence):
+        src = paths[idx]
+        ext = os.path.splitext(src)[1].lower()
+        basename = os.path.splitext(os.path.basename(src))[0]
+        left_idx = sequence[i - 1] if i > 0 else None
+        right_idx = sequence[i + 1] if i + 1 < len(sequence) else None
+        d_left = _format_distance(float(np.linalg.norm(feats[idx] - feats[left_idx]))) if left_idx is not None else "0.0000"
+        d_right = _format_distance(float(np.linalg.norm(feats[idx] - feats[right_idx]))) if right_idx is not None else "0.0000"
+        cluster_id = int(cluster_id_map.get(int(idx), 0))
+        if naming_mode == "distance":
+            names.append(f"{fmt.format(i)}_{d_left}-{d_right}_{basename}{ext}")
+        elif naming_mode == "distance_plus":
+            names.append(f"{fmt.format(i)}_{cluster_id}_{d_left}-{d_right}_{basename}{ext}")
+        else:
+            names.append(f"{fmt.format(i)}_{basename}{ext}")
+    return names
+
+
+def _export_cluster_sort(
+    paths: Sequence[str],
+    feats: np.ndarray,
+    result: ClusterResult,
+    config: Config,
+    base_dir: str,
+) -> Tuple[str, int, int]:
+    group_size = int(getattr(config.clustering, "group_filling_size", 10) or 10)
+    if group_size <= 0:
+        group_size = 10
+    naming_mode = getattr(config.clustering, "naming_mode", "default")
+    use_centroid = bool(getattr(config.clustering, "cluster_sort_use_centroid", False))
+
+    # Map original cluster id for naming/contiguity
+    cluster_id_map: Dict[int, int] = {}
+    for cid, cl in enumerate(result.clusters, start=1):
+        for idx in cl:
+            cluster_id_map[int(idx)] = int(cid)
+
+    # Внутренняя сортировка всех кластеров
+    prepared: List[List[int]] = []
+    for cl in result.clusters:
+        ordered = _order_cluster_items(list(cl), feats, config)
+        prepared.append(ordered)
+
+    # Order discarded (noise) as base chain
+    base_seq = _order_discarded(list(result.discarded), feats, config)
+    feats_cache = feats.astype(np.float32, copy=False)
+
+    # Compute best insertion pos/orientation on base_seq (without mutation)
+    cluster_structs = []
+    for pid, cl in enumerate(prepared):
+        items = list(cl)
+        best_pos, best_oriented, best_cost, centroid = _compute_cluster_cli(items, base_seq, feats_cache, use_centroid)
+        cluster_structs.append(
+            {
+                "pid": pid,
+                "items": best_oriented,
+                "best_pos": best_pos,
+                "best_cost": best_cost,
+                "orig_size": len(items),
+                "centroid": centroid,
+            }
+        )
+
+    # Sort clusters by CLi (then cost)
+    cluster_structs.sort(key=lambda c: (c["best_pos"], c["best_cost"]))
+
+    # Start from ordered discarded list and insert clusters one by one (shifting positions)
+    seq: List[int] = list(base_seq)
+    spans: List[Tuple[int, int, int]] = []
+    offset = 0
+
+    for cl in cluster_structs:
+        desired = int(min(cl["best_pos"] + offset, len(seq)))
+
+        best_start = None
+        best_orient = cl["items"]
+        best_cost_place = float("inf")
+        candidates = _candidate_starts_for_cluster(desired, len(cl["items"]), len(seq), group_size)
+        for start in candidates:
+            for orient in (cl["items"], list(reversed(cl["items"]))):
+                cost = _placement_cost(seq, start, orient, feats_cache, group_size, desired, use_centroid, cl["centroid"])
+                if cost < best_cost_place:
+                    best_cost_place = cost
+                    best_start = start
+                    best_orient = orient
+                elif cost == best_cost_place and best_start is not None and abs(start - desired) < abs(best_start - desired):
+                    best_start = start
+                    best_orient = orient
+        if best_start is None:
+            best_start = len(seq)
+        seq[best_start:best_start] = best_orient
+        offset += len(best_orient)
+        spans.append((cl["pid"], best_start, best_start + len(best_orient) - 1))
+        LOGGER.debug(
+            f"[cluster_sort] insert pid={cl['pid']} size={len(best_orient)} orig_size={cl['orig_size']} "
+            f"best_pos={cl['best_pos']} cost={cl['best_cost']:.4f} insert_at={best_start} "
+            f"group={best_start//group_size if group_size>0 else 0}"
+        )
+
+    for pid, start, end in spans:
+        LOGGER.debug(f"[cluster_sort] span pid={pid} start={start} end={end} len={end-start+1}")
+
+    pos_by_cid: Dict[int, List[int]] = {}
+    for pos, idx in enumerate(seq):
+        cid = int(cluster_id_map.get(int(idx), 0))
+        if cid > 0:
+            pos_by_cid.setdefault(cid, []).append(pos)
+
+    for cid, positions in pos_by_cid.items():
+        positions.sort()
+        span_len = positions[-1] - positions[0] + 1
+        if span_len != len(positions):
+            LOGGER.debug(
+                f"[cluster_sort] non-contiguous cluster_id={cid}: size={len(positions)} span={span_len} "
+                f"positions(sample)={positions[:5]}...{positions[-5:] if len(positions)>5 else positions}"
+            )
+
+    if not config.misc.list_only:
+        names = _build_sequence_names(seq, feats, paths, cluster_id_map, naming_mode)
+        _copy_with_custom_names(paths, seq, names, base_dir, config)
+    LOGGER.info(
+        f"Cluster-sort output saved to: {base_dir} "
+        f"(groupsize={group_size}, use_centroid={'yes' if use_centroid else 'no'})."
+    )
+    return base_dir, len(result.clusters), len(result.discarded)
+
+
 def _prepare_group_filling_clusters(
     clusters: Sequence[Sequence[int]],
     feats: np.ndarray,
@@ -723,14 +1071,22 @@ def _prepare_group_filling_clusters(
     split_mode: str,
 ) -> List[List[int]]:
     prepared: List[List[int]] = []
-    for cl in clusters:
+    for idx, cl in enumerate(clusters):
         current = list(cl)
         if len(current) <= group_size:
             prepared.append(current)
         elif split_mode == "fi":
-            prepared.extend(_split_cluster_by_fi(current, feats, config, group_size))
+            parts = _split_cluster_by_fi(current, feats, config, group_size)
+            prepared.extend(parts)
+            LOGGER.debug(
+                f"[group_filling] split cluster #{idx} size={len(current)} via fi -> parts={list(map(len, parts))}"
+            )
         else:
-            prepared.extend(_split_cluster_by_recluster(current, feats, config, group_size))
+            parts = _split_cluster_by_recluster(current, feats, config, group_size)
+            prepared.extend(parts)
+            LOGGER.debug(
+                f"[group_filling] split cluster #{idx} size={len(current)} via recluster -> parts={list(map(len, parts))}"
+            )
 
     if prepared:
         sizes = np.array([len(c) for c in prepared], dtype=np.int32)
@@ -744,6 +1100,20 @@ def _prepare_group_filling_clusters(
     return prepared
 
 
+def _sort_clusters_by_embedding(clusters: List[List[int]], feats: np.ndarray, config: Config) -> List[List[int]]:
+    if not clusters:
+        return clusters
+    centroids = []
+    for cl in clusters:
+        if cl:
+            centroids.append(np.mean(feats[np.array(cl, dtype=int)].astype(np.float32, copy=False), axis=0))
+        else:
+            centroids.append(np.zeros((feats.shape[1],), dtype=np.float32))
+    centroids_arr = np.stack(centroids, axis=0).astype(np.float32, copy=False)
+    order = farthest_insertion_path(centroids_arr, config, show_progress=False)
+    return [clusters[int(i)] for i in order]
+
+
 def _split_cluster_by_fi(
     cluster: List[int],
     feats: np.ndarray,
@@ -753,7 +1123,7 @@ def _split_cluster_by_fi(
     if len(cluster) <= group_size:
         return [list(cluster)]
     sub_feats = feats[cluster]
-    local_order = farthest_insertion_path(sub_feats, config)
+    local_order = farthest_insertion_path(sub_feats, config, show_progress=False)
     mapped = [cluster[int(i)] for i in local_order]
     return [mapped[s : s + group_size] for s in range(0, len(mapped), group_size)]
 
@@ -771,14 +1141,14 @@ def _split_cluster_by_recluster(
     if base_thr <= 0:
         return _split_cluster_by_fi(cluster, feats, config, group_size)
     lo = max(1e-6, base_thr * 1e-4)
-    hi = base_thr
+    hi = base_thr * 1.1
     best: List[List[int]] = []
     found = False
 
     orig_thr = float(config.clustering.threshold)
     orig_min = int(config.clustering.min_size)
     try:
-        for _ in range(14):
+        for _ in range(8):
             mid = 0.5 * (lo + hi)
             config.clustering.threshold = mid
             config.clustering.min_size = 1
@@ -1306,11 +1676,13 @@ def export_clusters(
     save_mode = _resolve_save_mode(config)
     save_discarded = _resolve_save_discarded(config)
 
-    if save_mode in {"default", "json", "group_filling"}:
+    if save_mode in {"default", "json", "group_filling", "cluster_sort"}:
         os.makedirs(base_dir, exist_ok=True)
 
     if save_mode == "group_filling":
         return _export_group_filling(paths, feats, result, config, base_dir, save_discarded)
+    if save_mode == "cluster_sort":
+        return _export_cluster_sort(paths, feats, result, config, base_dir)
 
     naming_mode = getattr(config.clustering, "naming_mode", "default")
     compute_distances = naming_mode in {"distance", "distance_plus"} or save_mode in {"json", "print"}

@@ -8,7 +8,7 @@ os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 
 from cli import CONFIG, LOGGER, TASK_PLAN, HEAVY_TASKS
 from core import run_sorting_pipeline, run_search_pipeline, run_clustering_pipeline
-from database import list_database_files, move_database_entries
+from database import list_database_files, move_database_entries, process_and_cache_features
 
 if __name__ == "__main__":
 
@@ -30,6 +30,11 @@ if __name__ == "__main__":
             LOGGER.error(f"Source folder {CONFIG.files.src_folder} not found.")
             os.makedirs(CONFIG.files.src_folder, exist_ok=True)
             sys.exit(1)
+
+    if CONFIG.misc.index_only:
+        LOGGER.info("Index-only mode selected: computing/caching features and exiting.")
+        process_and_cache_features(DB_FILE, CONFIG)
+        sys.exit(0)
 
     # Execute tasks in the order they were requested
     for t in TASK_PLAN:

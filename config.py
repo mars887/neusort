@@ -169,7 +169,7 @@ class ClusteringConfig:
 
         raw_save_mode = _group_str(grouped, 'cluster', 'save_mode', 'default')
         save_mode = raw_save_mode.lower()
-        if save_mode not in {'default', 'json', 'print', 'group_filling'}:
+        if save_mode not in {'default', 'json', 'print', 'group_filling', 'cluster_sort'}:
             save_mode = 'default'
 
         split_mode = _group_str(grouped, 'cluster', 'splitting_mode', 'recluster').lower()
@@ -280,6 +280,7 @@ class MiscConfig:
     list_objects: bool
     move_db: Optional[tuple[str, str]]
     cluster: bool
+    index_only: bool
 
     @classmethod
     def from_args(cls, args: Any) -> "MiscConfig":
@@ -293,6 +294,7 @@ class MiscConfig:
             list_objects=bool(getattr(args, 'list_objects', False)),
             move_db=move_tuple,
             cluster=bool(getattr(args, 'cluster', False)),
+            index_only=bool(getattr(args, 'index_only', False)),
         )
 
 

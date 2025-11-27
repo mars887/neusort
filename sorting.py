@@ -31,6 +31,7 @@ def farthest_insertion_path(
     *,
     window: int = 40,
     seed: Optional[int] = 42,
+    show_progress: bool = True,
 ) -> np.ndarray:
     """
     Быстрый Farthest Insertion:
@@ -175,7 +176,7 @@ def farthest_insertion_path(
         return (u_list[k], v_list[k], float(inc[k]))
 
     remaining = int(N - 2)
-    pbar = tqdm(total=remaining, desc="  - Farthest Insertion (fast)", leave=False)
+    pbar = tqdm(total=remaining, desc="  - Farthest Insertion (fast)", leave=False, disable=not show_progress)
 
     while remaining > 0:
         f = int(np.argmax(dist_cache_sq))      # самая дальняя точка (посещённые = -inf)
@@ -245,6 +246,7 @@ def farthest_insertion_path_clustered(
     config,
     n_clusters: int = None,
     parallel: bool = True,
+    show_progress: bool = True,
 ) -> np.ndarray:
     """
     Clustered Farthest Insertion (качество + стабильность, с расширенным логированием).
@@ -363,7 +365,7 @@ def farthest_insertion_path_clustered(
         local = X[inds]
         # окно ~6% (48..128)
         w = max(48, min(128, int(0.06 * len(inds))))
-        local_order_local = farthest_insertion_path(local, config, window=w)
+        local_order_local = farthest_insertion_path(local, config, window=w, show_progress=show_progress)
         seq = inds[local_order_local]
 
         # исходная статистика
@@ -962,20 +964,27 @@ def sort_by_ann_mst(feats: np.ndarray, k: int, config: Config):
     # Работаем с копией float32 для FAISS
     feats_copy = feats.astype('float32').copy()
 
-    # --- Шаг 1: Индексация в FAISS ---
+       # --- Шаг 1: Индексация в FAISS ---
     step_start_time = time.time()
     LOGGER.info(f"\n[1/5] Шаг 1: Индексация векторов в FAISS...")
     try:
-        # ИЗМЕНЕНИЕ 1: Убираем нормализацию. Она не нужна для евклидова расстояния.
-        # faiss.normalize_L2(feats_copy)
+        index_is_gpu = False  # <--- добавили флаг
 
-        # ИЗМЕНЕНИЕ 2: Используем IndexFlatL2 для евклидова расстояния вместо IndexFlatIP.
         index = faiss.IndexFlatL2(d)
 
-        if not config.model.use_cpu and torch is not None and torch.cuda.is_available():
+        if (
+            not config.model.use_cpu
+            and torch is not None
+            and torch.cuda.is_available()
+            and hasattr(faiss, "StandardGpuResources")
+            and hasattr(faiss, "index_cpu_to_gpu")
+        ):
             LOGGER.info("  - Попытка использовать GPU для FAISS...")
             res = faiss.StandardGpuResources()
+            # опционально: можно отключить стековую темп-память, но нам хватит одиночного потока
+            # res.setTempMemory(0)
             index = faiss.index_cpu_to_gpu(res, 0, index)
+            index_is_gpu = True
             LOGGER.info("  - Индекс успешно перенесен на GPU.")
 
         index.add(feats_copy)
@@ -984,6 +993,7 @@ def sort_by_ann_mst(feats: np.ndarray, k: int, config: Config):
     except Exception as e:
         LOGGER.error(f"! Ошибка на шаге 1: {e}")
         return None
+
 
     # --- Шаг 2: Поиск k-ближайших соседей ---
     step_start_time = time.time()
@@ -1001,7 +1011,6 @@ def sort_by_ann_mst(feats: np.ndarray, k: int, config: Config):
         indices = np.empty((n, k + 1), dtype=np.int64)
 
         def search_batch(start: int, end: int):
-            """Execute FAISS search for the given slice in a worker thread."""
             distances_batch, indices_batch = index.search(feats_copy[start:end], k + 1)
             return start, end, distances_batch, indices_batch
 
@@ -1017,6 +1026,15 @@ def sort_by_ann_mst(feats: np.ndarray, k: int, config: Config):
         else:
             max_workers = min(len(batch_ranges), max(1, requested_workers))
         max_workers = max(1, max_workers)
+
+
+        if 'index_is_gpu' in locals() and index_is_gpu:
+            if max_workers > 1:
+                LOGGER.info(
+                    f"  - FAISS GPU-индекс не потокобезопасен; принудительно ставим max_workers=1 "
+                    f"(было запросено {max_workers})."
+                )
+            max_workers = 1
 
         LOGGER.info(f"  - K-NN worker threads: {max_workers}")
 

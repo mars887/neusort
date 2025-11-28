@@ -148,6 +148,7 @@ class ClusteringConfig:
     pca_whiten: bool
     pairwise_limit: int
     distance_chunk_size: int
+    enable_refine: bool
 
     @classmethod
     def from_args(cls, args: Any, grouped: dict[str, Any]) -> "ClusteringConfig":
@@ -155,7 +156,7 @@ class ClusteringConfig:
         algo = _group_str(grouped, 'cluster', 'algorithm', 'distance').lower()
         if algo == 'graph':
             algo = 'cc_graph'
-        if algo not in {'distance', 'hdbscan', 'dbscan', 'cc_graph', 'mutual_graph'}:
+        if algo not in {'distance', 'hdbscan', 'dbscan', 'cc_graph', 'mutual_graph', 'agglomerative', 'agglomerative_complete', 'optics', 'snn', 'rank_mutual', 'adaptive_graph'}:
             algo = 'distance'
 
         threshold = max(0.0, _group_float(grouped, 'cluster', 'threshold', 0.35))
@@ -199,6 +200,7 @@ class ClusteringConfig:
         distance_chunk_size = int(getattr(args, 'cluster_distance_chunk', 1024))
         if distance_chunk_size <= 0:
             distance_chunk_size = 1024
+        enable_refine = _group_bool(grouped, 'cluster', 'enable_refine', False)
 
         return cls(
             enabled=enabled,
@@ -218,6 +220,7 @@ class ClusteringConfig:
             pca_whiten=pca_whiten,
             pairwise_limit=pairwise_limit,
             distance_chunk_size=distance_chunk_size,
+            enable_refine=enable_refine,
         )
 
 

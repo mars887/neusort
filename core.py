@@ -10,9 +10,16 @@ from cli import LOGGER, ENTERED_GROUPED
 from clustering import (
     cluster_by_distance,
     cluster_by_hdbscan,
+    cluster_by_agglomerative,
+    cluster_by_agglomerative_complete,
+    cluster_by_optics,
+    cluster_by_snn,
+    cluster_by_rank_mutual,
+    cluster_by_adaptive_graph,
     cluster_by_dbscan,
     cluster_by_graph,
     cluster_by_mutual_graph,
+    refine_clusters_structure,
     apply_pca_whitening,
     export_clusters,
 )
@@ -118,6 +125,15 @@ def run_clustering_pipeline(config, db_file, index_file):
     if algo == "hdbscan":
         LOGGER.info("Running clustering with HDBSCAN (density-based, accuracy-focused)...")
         result = cluster_by_hdbscan(feats, config)
+    elif algo == "agglomerative":
+        LOGGER.info("Running clustering with Agglomerative Hierarchical (Ward) ...")
+        result = cluster_by_agglomerative(feats, config)
+    elif algo == "agglomerative_complete":
+        LOGGER.info("Running clustering with Agglomerative (Complete Linkage) ...")
+        result = cluster_by_agglomerative_complete(feats, config)
+    elif algo == "optics":
+        LOGGER.info("Running clustering with OPTICS (xi method) ...")
+        result = cluster_by_optics(feats, config)
     elif algo == "dbscan":
         LOGGER.info("Running clustering with DBSCAN (density-based) ...")
         result = cluster_by_dbscan(feats, config, use_gpu_faiss)
@@ -127,9 +143,24 @@ def run_clustering_pipeline(config, db_file, index_file):
     elif algo == "mutual_graph":
         LOGGER.info("Running clustering with Mutual ε-graph (connected components) ...")
         result = cluster_by_mutual_graph(feats, config, use_gpu_faiss)
+    elif algo == "snn":
+        LOGGER.info("Running clustering with Shared Nearest Neighbors (SNN) ...")
+        result = cluster_by_snn(feats, config, use_gpu_faiss)
+    elif algo == "rank_mutual":
+        LOGGER.info("Running clustering with Rank-Based Reciprocal k-NN ...")
+        result = cluster_by_rank_mutual(feats, config, use_gpu_faiss)
+    elif algo == "adaptive_graph":
+        LOGGER.info("Running clustering with Adaptive Mutual Graph ...")
+        result = cluster_by_adaptive_graph(feats, config, use_gpu_faiss)
     else:
         LOGGER.info("Running clustering with distance-based greedy algorithm...")
         result = cluster_by_distance(feats, config, use_gpu_faiss)
+
+    if getattr(config.clustering, "enable_refine", False):
+        LOGGER.info("Refining clusters (split/prune/garbage filter)...")
+        refined = refine_clusters_structure(result.clusters, feats, config)
+        refined.discarded.extend(result.discarded)
+        result = refined
 
     summary_path, cluster_count, discarded_count = export_clusters(paths, feats, result, config)
     LOGGER.info(

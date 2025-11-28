@@ -3,6 +3,7 @@ import math
 import os
 import shutil
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -11,6 +12,11 @@ try:
     import hdbscan  # type: ignore
 except Exception:  # pragma: no cover
     hdbscan = None
+try:
+    from sklearn.cluster import AgglomerativeClustering, OPTICS as SklearnOPTICS  # type: ignore
+except Exception:  # pragma: no cover
+    AgglomerativeClustering = None
+    SklearnOPTICS = None
 import numpy as np
 from tqdm.auto import tqdm
 
@@ -318,12 +324,22 @@ def cluster_by_distance(feats: np.ndarray, config: Config, use_gpu: bool) -> Clu
     threshold = float(config.clustering.threshold)
     similarity_ratio = float(config.clustering.similarity_ratio)
     min_size = int(config.clustering.min_size)
+    is_debug = getattr(config.misc, "log_level", "") == "debug"
+
+    if is_debug:
+        LOGGER.debug(f"[distance] threshold={threshold:.4f} ratio={similarity_ratio:.3f} min_size={min_size}")
 
     if threshold <= 0.0:
         LOGGER.error("Clustering threshold must be positive. No clusters will be produced.")
         return ClusterResult(clusters=[], discarded=list(range(feats.shape[0])))
 
     neighbors = _build_neighbor_sets(feats, threshold, use_gpu)
+    if is_debug and neighbors:
+        counts = np.array([len(n) for n in neighbors], dtype=np.int32)
+        LOGGER.debug(
+            f"[distance] neighbor stats -> min={int(counts.min())}, mean={float(np.mean(counts)):.2f}, "
+            f"max={int(counts.max())}"
+        )
     raw_clusters = _assign_clusters(neighbors, similarity_ratio, config)
 
     valid_clusters: List[List[int]] = []
@@ -362,6 +378,8 @@ def cluster_by_hdbscan(feats: np.ndarray, config: Config) -> ClusterResult:
     if n == 0:
         return ClusterResult(clusters=[], discarded=[])
 
+    is_debug = getattr(config.misc, "log_level", "") == "debug"
+
     if hdbscan is None:
         LOGGER.error("HDBSCAN is not installed. Falling back to distance-based clustering.")
         # Fallback to distance-based clustering in CPU mode for safety
@@ -369,6 +387,8 @@ def cluster_by_hdbscan(feats: np.ndarray, config: Config) -> ClusterResult:
 
     feats32 = feats.astype(np.float32, copy=False)
     min_cluster_size = max(1, int(config.clustering.min_size))
+    if is_debug:
+        LOGGER.debug(f"[hdbscan] samples={n} min_cluster_size={min_cluster_size} dim={feats32.shape[1]}")
 
     # Configure HDBSCAN with a robust default; `min_samples=None` => equals `min_cluster_size`.
     clusterer = hdbscan.HDBSCAN(
@@ -402,6 +422,8 @@ def cluster_by_hdbscan(feats: np.ndarray, config: Config) -> ClusterResult:
             f"HDBSCAN summary: {len(clusters)} clusters, "
             f"size min={int(sizes.min())}, median={int(np.median(sizes))}, max={int(sizes.max())}."
         )
+        if is_debug:
+            LOGGER.debug(f"[hdbscan] noise={len(discarded)}")
     else:
         LOGGER.info("HDBSCAN summary: no clusters were produced.")
 
@@ -409,6 +431,192 @@ def cluster_by_hdbscan(feats: np.ndarray, config: Config) -> ClusterResult:
         LOGGER.info(f"HDBSCAN: {len(discarded)} images marked as noise (unclustered).")
 
     return ClusterResult(clusters=clusters, discarded=discarded)
+
+
+def cluster_by_agglomerative(feats: np.ndarray, config: Config) -> ClusterResult:
+    """Cluster embeddings using agglomerative hierarchical clustering (Ward linkage)."""
+    n = int(feats.shape[0])
+    if n == 0:
+        return ClusterResult(clusters=[], discarded=[])
+
+    if AgglomerativeClustering is None:
+        LOGGER.error("scikit-learn is not installed. Falling back to distance-based clustering.")
+        return cluster_by_distance(feats, config, use_gpu=False)
+
+    threshold = float(config.clustering.threshold)
+    min_size = int(config.clustering.min_size)
+    if threshold <= 0.0:
+        LOGGER.error("Agglomerative clustering requires positive distance_threshold.")
+        return ClusterResult(clusters=[], discarded=list(range(n)))
+
+    feats32 = feats.astype(np.float32, copy=False)
+    try:
+        model = AgglomerativeClustering(
+            n_clusters=None,
+            distance_threshold=threshold,
+            linkage="ward",
+            metric="euclidean",
+        )
+    except TypeError:
+        model = AgglomerativeClustering(
+            n_clusters=None,
+            distance_threshold=threshold,
+            linkage="ward",
+            affinity="euclidean",
+        )
+
+    labels = model.fit_predict(feats32)
+
+    clusters_dict: Dict[int, List[int]] = {}
+    discarded: List[int] = []
+    for idx, label in enumerate(labels):
+        clusters_dict.setdefault(int(label), []).append(idx)
+
+    valid_clusters: List[List[int]] = []
+    for members in clusters_dict.values():
+        if len(members) >= min_size:
+            valid_clusters.append(members)
+        else:
+            discarded.extend(members)
+
+    if valid_clusters:
+        sizes = np.array([len(c) for c in valid_clusters], dtype=np.int32)
+        LOGGER.info(
+            f"Agglomerative summary: {len(valid_clusters)} clusters, "
+            f"size min={int(sizes.min())}, median={int(np.median(sizes))}, max={int(sizes.max())}."
+        )
+        if getattr(config.misc, "log_level", "") == "debug":
+            LOGGER.debug(f"[agglomerative] label_count={len(clusters_dict)} discarded={len(discarded)}")
+    else:
+        LOGGER.info("Agglomerative summary: no clusters satisfied the minimum size requirement.")
+
+    if discarded:
+        LOGGER.info(f"Agglomerative: {len(discarded)} images discarded for being below min_size.")
+
+    return ClusterResult(clusters=valid_clusters, discarded=discarded)
+
+
+def cluster_by_optics(feats: np.ndarray, config: Config) -> ClusterResult:
+    """Cluster embeddings using OPTICS (Ordering Points To Identify the Clustering Structure)."""
+    n = int(feats.shape[0])
+    if n == 0:
+        return ClusterResult(clusters=[], discarded=[])
+
+    if SklearnOPTICS is None:
+        LOGGER.error("scikit-learn is not installed. Falling back to DBSCAN-style clustering.")
+        return cluster_by_dbscan(feats, config, use_gpu=False)
+
+    min_samples = max(2, int(config.clustering.min_size))
+    max_eps = float(config.clustering.threshold)
+    if max_eps <= 0.0:
+        max_eps = np.inf
+
+    feats32 = feats.astype(np.float32, copy=False)
+    if getattr(config.misc, "log_level", "") == "debug":
+        LOGGER.debug(f"[optics] samples={n} min_samples={min_samples} max_eps={max_eps}")
+    model = SklearnOPTICS(
+        min_samples=min_samples,
+        max_eps=max_eps,
+        metric="euclidean",
+        cluster_method="xi",
+    )
+
+    labels = model.fit_predict(feats32)
+
+    clusters_dict: Dict[int, List[int]] = {}
+    discarded: List[int] = []
+    for idx, label in enumerate(labels):
+        if int(label) < 0:
+            discarded.append(idx)
+            continue
+        clusters_dict.setdefault(int(label), []).append(idx)
+
+    raw_clusters = list(clusters_dict.values())
+    min_size = int(config.clustering.min_size)
+    final_clusters: List[List[int]] = []
+    for cluster in raw_clusters:
+        if len(cluster) >= min_size:
+            final_clusters.append(cluster)
+        else:
+            discarded.extend(cluster)
+
+    if final_clusters:
+        sizes = np.array([len(c) for c in final_clusters], dtype=np.int32)
+        LOGGER.info(
+            f"OPTICS summary: {len(final_clusters)} clusters, "
+            f"size min={int(sizes.min())}, median={int(np.median(sizes))}, max={int(sizes.max())}."
+        )
+    else:
+        LOGGER.info("OPTICS summary: no clusters satisfied the minimum size requirement.")
+
+    if discarded:
+        LOGGER.info(f"OPTICS: {len(discarded)} images marked as noise or below min_size.")
+
+    return ClusterResult(clusters=final_clusters, discarded=discarded)
+
+
+def cluster_by_agglomerative_complete(feats: np.ndarray, config: Config) -> ClusterResult:
+    """Hierarchical clustering with complete linkage (max-pair distance <= threshold)."""
+    n = int(feats.shape[0])
+    if n == 0:
+        return ClusterResult(clusters=[], discarded=[])
+
+    if AgglomerativeClustering is None:
+        LOGGER.error("scikit-learn is not installed. Falling back to distance-based clustering.")
+        return cluster_by_distance(feats, config, use_gpu=False)
+
+    threshold = float(config.clustering.threshold)
+    min_size = int(config.clustering.min_size)
+    if threshold <= 0.0:
+        LOGGER.error("Agglomerative (complete) requires positive distance_threshold.")
+        return ClusterResult(clusters=[], discarded=list(range(n)))
+
+    feats32 = feats.astype(np.float32, copy=False)
+    LOGGER.info("Running Agglomerative Clustering (Complete Linkage)...")
+    try:
+        model = AgglomerativeClustering(
+            n_clusters=None,
+            distance_threshold=threshold,
+            linkage="complete",
+            metric="euclidean",
+        )
+    except TypeError:
+        model = AgglomerativeClustering(
+            n_clusters=None,
+            distance_threshold=threshold,
+            linkage="complete",
+            affinity="euclidean",
+        )
+
+    labels = model.fit_predict(feats32)
+
+    clusters_dict: Dict[int, List[int]] = {}
+    for idx, label in enumerate(labels):
+        clusters_dict.setdefault(int(label), []).append(idx)
+
+    valid_clusters: List[List[int]] = []
+    discarded: List[int] = []
+    for members in clusters_dict.values():
+        if len(members) >= min_size:
+            valid_clusters.append(members)
+        else:
+            discarded.extend(members)
+
+    if valid_clusters:
+        sizes = np.array([len(c) for c in valid_clusters], dtype=np.int32)
+        LOGGER.info(
+            f"Agglomerative (complete) summary: {len(valid_clusters)} clusters, "
+            f"size min={int(sizes.min())}, median={int(np.median(sizes))}, max={int(sizes.max())}."
+        )
+        if getattr(config.misc, "log_level", "") == "debug":
+            LOGGER.debug(f"[agglomerative_complete] label_count={len(clusters_dict)} discarded={len(discarded)}")
+    else:
+        LOGGER.info("Agglomerative (complete) summary: no clusters satisfied the minimum size requirement.")
+
+    if discarded:
+        LOGGER.info(f"Agglomerative (complete): {len(discarded)} images discarded for being below min_size.")
+
+    return ClusterResult(clusters=valid_clusters, discarded=discarded)
 
 
 def cluster_by_dbscan(feats: np.ndarray, config: Config, use_gpu: bool) -> ClusterResult:
@@ -431,6 +639,12 @@ def cluster_by_dbscan(feats: np.ndarray, config: Config, use_gpu: bool) -> Clust
     neighbors = _build_neighbor_sets(feats, eps, use_gpu)
 
     min_samples = max(1, int(config.clustering.min_size))
+    if getattr(config.misc, "log_level", "") == "debug" and neighbors:
+        deg = np.array([len(s) for s in neighbors], dtype=np.int32)
+        LOGGER.debug(
+            f"[dbscan] eps={eps:.4f} min_samples={min_samples} neighbor deg stats "
+            f"min={int(deg.min())} mean={float(np.mean(deg)):.2f} max={int(deg.max())}"
+        )
 
     UNVISITED = 0
     VISITED = 1
@@ -524,6 +738,12 @@ def cluster_by_graph(feats: np.ndarray, config: Config, use_gpu: bool) -> Cluste
         return ClusterResult(clusters=[], discarded=list(range(n)))
 
     neighbors = _build_neighbor_sets(feats, eps, use_gpu)
+    if getattr(config.misc, "log_level", "") == "debug" and neighbors:
+        deg = np.array([len(s) for s in neighbors], dtype=np.int32)
+        LOGGER.debug(
+            f"[cc_graph] eps={eps:.4f} min_size={config.clustering.min_size} "
+            f"deg stats min={int(deg.min())} mean={float(np.mean(deg)):.2f} max={int(deg.max())}"
+        )
 
     # Symmetrize adjacency to form an undirected graph (OR symmetry)
     show_progress = config.misc.log_level == "default"
@@ -604,6 +824,12 @@ def cluster_by_mutual_graph(feats: np.ndarray, config: Config, use_gpu: bool) ->
         return ClusterResult(clusters=[], discarded=list(range(n)))
 
     neighbors = _build_neighbor_sets(feats, eps, use_gpu)
+    if getattr(config.misc, "log_level", "") == "debug" and neighbors:
+        deg = np.array([len(s) for s in neighbors], dtype=np.int32)
+        LOGGER.debug(
+            f"[mutual_graph] eps={eps:.4f} min_size={config.clustering.min_size} "
+            f"deg stats min={int(deg.min())} mean={float(np.mean(deg)):.2f} max={int(deg.max())}"
+        )
 
     show_progress = config.misc.log_level == "default"
     progress_build = tqdm(total=n, desc="Building mutual graph", disable=not show_progress)
@@ -670,6 +896,515 @@ def cluster_by_mutual_graph(feats: np.ndarray, config: Config, use_gpu: bool) ->
     return ClusterResult(clusters=valid_clusters, discarded=discarded)
 
 
+def cluster_by_snn(feats: np.ndarray, config: Config, use_gpu: bool) -> ClusterResult:
+    """Cluster embeddings using a Shared Nearest Neighbors (SNN) graph."""
+    n, d = feats.shape
+    if n == 0:
+        return ClusterResult(clusters=[], discarded=[])
+
+    min_size = int(config.clustering.min_size)
+    k = max(20, min_size * 2)
+    if k >= n:
+        k = n - 1
+    if k < 1:
+        if n >= min_size:
+            return ClusterResult(clusters=[list(range(n))], discarded=[])
+        return ClusterResult(clusters=[], discarded=list(range(n)))
+
+    raw_thr = float(config.clustering.threshold)
+    if raw_thr > 1.0:
+        shared_thr = int(raw_thr)
+    elif raw_thr > 0.0:
+        shared_thr = int(k * raw_thr)
+    else:
+        shared_thr = int(k * 0.15)
+    shared_thr = max(1, shared_thr)
+
+    LOGGER.info(f"SNN clustering parameters: k={k}, required_shared={shared_thr}")
+    if getattr(config.misc, "log_level", "") == "debug":
+        LOGGER.debug(f"[snn] samples={n} dim={d} k={k} shared_thr={shared_thr}")
+
+    feats32 = feats.astype(np.float32, copy=False)
+    index_cpu = faiss.IndexFlatL2(d)
+    index_cpu.add(feats32)
+    index = index_cpu
+    if use_gpu:
+        try:
+            res = faiss.StandardGpuResources()
+            index = faiss.index_cpu_to_gpu(res, 0, index_cpu)
+        except Exception as exc:
+            LOGGER.info(f"SNN: falling back to CPU FAISS: {exc}")
+
+    _, I = index.search(feats32, k + 1)
+
+    neighbors_sets = [set(map(int, I[i, 1:])) for i in range(n)]
+    adj: List[List[int]] = [[] for _ in range(n)]
+
+    show_progress = config.misc.log_level == "default"
+    progress = tqdm(total=n, desc="SNN Graph Build", disable=not show_progress)
+
+    for i in range(n):
+        i_neighbors = neighbors_sets[i]
+        candidates = I[i, 1:]
+        for j_raw in candidates:
+            j = int(j_raw)
+            if j <= i:
+                continue
+            shared_count = len(i_neighbors.intersection(neighbors_sets[j]))
+            if shared_count >= shared_thr:
+                adj[i].append(j)
+                adj[j].append(i)
+        if progress:
+            progress.update(1)
+    if progress:
+        progress.close()
+
+    visited = np.zeros(n, dtype=bool)
+    clusters: List[List[int]] = []
+
+    progress_cc = tqdm(total=n, desc="SNN Components", disable=not show_progress)
+    from collections import deque
+    for i in range(n):
+        if visited[i]:
+            continue
+        visited[i] = True
+        comp: List[int] = []
+        queue = deque([i])
+        while queue:
+            u = queue.popleft()
+            comp.append(u)
+            for v in adj[u]:
+                if not visited[v]:
+                    visited[v] = True
+                    queue.append(v)
+        clusters.append(comp)
+        if progress_cc:
+            progress_cc.update(len(comp))
+    if progress_cc:
+        progress_cc.close()
+
+    valid_clusters: List[List[int]] = []
+    discarded: List[int] = []
+    for comp in clusters:
+        if len(comp) >= min_size:
+            valid_clusters.append(comp)
+        else:
+            discarded.extend(comp)
+
+    if valid_clusters:
+        sizes = np.array([len(c) for c in valid_clusters], dtype=np.int32)
+        LOGGER.info(
+            f"SNN summary: {len(valid_clusters)} clusters, "
+            f"size min={int(sizes.min())}, median={int(np.median(sizes))}, max={int(sizes.max())}."
+        )
+    else:
+        LOGGER.info("SNN summary: no clusters satisfied the minimum size requirement.")
+
+    if discarded:
+        LOGGER.info(f"SNN: {len(discarded)} images marked as noise or below min_size.")
+
+    return ClusterResult(clusters=valid_clusters, discarded=discarded)
+
+
+def cluster_by_rank_mutual(feats: np.ndarray, config: Config, use_gpu: bool) -> ClusterResult:
+    """Cluster using reciprocal k-NN (rank-based mutual links)."""
+    n, d = feats.shape
+    if n == 0:
+        return ClusterResult(clusters=[], discarded=[])
+
+    min_size = int(config.clustering.min_size)
+    k = max(5, int(min_size * 2) + 2)
+    k = min(k, 50)
+    if n == 1:
+        return ClusterResult(clusters=[list(range(n))] if min_size <= 1 else [], discarded=([] if min_size <= 1 else [0]))
+    k = min(k, max(1, n - 1))
+
+    LOGGER.info(f"Rank Mutual Clustering: searching top-{k} neighbors (reciprocal).")
+    if getattr(config.misc, "log_level", "") == "debug":
+        LOGGER.debug(f"[rank_mutual] samples={n} min_size={min_size} k={k} dim={d}")
+
+    feats32 = feats.astype(np.float32, copy=False)
+    index_cpu = faiss.IndexFlatL2(d)
+    index_cpu.add(feats32)
+    index = index_cpu
+    if use_gpu:
+        try:
+            res = faiss.StandardGpuResources()
+            index = faiss.index_cpu_to_gpu(res, 0, index_cpu)
+        except Exception as exc:
+            LOGGER.info(f"Rank Mutual: falling back to CPU FAISS: {exc}")
+
+    _, I = index.search(feats32, k + 1)
+
+    neighbor_sets = [set(int(x) for x in I[i, 1:]) for i in range(n)]
+    adj: List[List[int]] = [[] for _ in range(n)]
+
+    show_progress = config.misc.log_level == "default"
+    progress = tqdm(total=n, desc="Building reciprocal graph", disable=not show_progress)
+
+    for i in range(n):
+        candidates = I[i, 1:]
+        for neighbor_idx in candidates:
+            j = int(neighbor_idx)
+            if j <= i:
+                continue
+            if i in neighbor_sets[j]:
+                adj[i].append(j)
+                adj[j].append(i)
+        if progress:
+            progress.update(1)
+    if progress:
+        progress.close()
+
+    visited = np.zeros(n, dtype=bool)
+    clusters: List[List[int]] = []
+    from collections import deque
+    for i in range(n):
+        if visited[i]:
+            continue
+        if not adj[i]:
+            visited[i] = True
+            continue
+        visited[i] = True
+        comp: List[int] = []
+        queue = deque([i])
+        while queue:
+            u = queue.popleft()
+            comp.append(u)
+            for v in adj[u]:
+                if not visited[v]:
+                    visited[v] = True
+                    queue.append(v)
+        clusters.append(comp)
+
+    valid_clusters: List[List[int]] = []
+    for comp in clusters:
+        if len(comp) >= min_size:
+            valid_clusters.append(comp)
+
+    clustered_mask = np.zeros(n, dtype=bool)
+    if valid_clusters:
+        clustered_mask[np.concatenate(valid_clusters)] = True
+    discarded = list(np.nonzero(~clustered_mask)[0])
+
+    if valid_clusters:
+        sizes = np.array([len(c) for c in valid_clusters], dtype=np.int32)
+        LOGGER.info(
+            f"Rank Mutual summary: {len(valid_clusters)} clusters, "
+            f"size min={int(sizes.min())}, median={int(np.median(sizes))}, max={int(sizes.max())}."
+        )
+    else:
+        LOGGER.info("Rank Mutual summary: no clusters produced.")
+
+    if discarded:
+        LOGGER.info(f"Rank Mutual: {len(discarded)} images marked as noise or below min_size.")
+
+    return ClusterResult(clusters=valid_clusters, discarded=discarded)
+
+
+def cluster_by_adaptive_graph(feats: np.ndarray, config: Config, use_gpu: bool) -> ClusterResult:
+    """Two-pass adaptive mutual graph clustering with stricter split for large clusters."""
+    n = int(feats.shape[0])
+    if n == 0:
+        return ClusterResult(clusters=[], discarded=[])
+
+    loose_threshold = float(config.clustering.threshold)
+    min_size = int(config.clustering.min_size)
+    max_size_before_split = max(20, min_size * 5)
+    strict_ratio = 0.85
+
+    if loose_threshold <= 0.0:
+        return ClusterResult(clusters=[], discarded=list(range(n)))
+
+    neighbors = _build_neighbor_sets(feats, loose_threshold, use_gpu)
+    if getattr(config.misc, "log_level", "") == "debug" and neighbors:
+        deg = np.array([len(s) for s in neighbors], dtype=np.int32)
+        LOGGER.debug(
+            f"[adaptive_graph] loose={loose_threshold:.4f} strict_ratio={strict_ratio} split_size>{max_size_before_split} "
+            f"deg stats min={int(deg.min())} mean={float(np.mean(deg)):.2f} max={int(deg.max())}"
+        )
+    adj = [set() for _ in range(n)]
+    for i in range(n):
+        for j in neighbors[i]:
+            if i in neighbors[j]:
+                adj[i].add(j)
+                adj[j].add(i)
+
+    visited = np.zeros(n, dtype=bool)
+    raw_clusters: List[List[int]] = []
+    from collections import deque
+    for i in range(n):
+        if visited[i]:
+            continue
+        visited[i] = True
+        if not adj[i]:
+            continue
+        comp: List[int] = []
+        queue = deque([i])
+        while queue:
+            u = queue.popleft()
+            comp.append(u)
+            for v in adj[u]:
+                if not visited[v]:
+                    visited[v] = True
+                    queue.append(v)
+        raw_clusters.append(comp)
+
+    final_clusters: List[List[int]] = []
+    discarded: List[int] = []
+    strict_threshold_sq = (loose_threshold * strict_ratio) ** 2
+
+    LOGGER.info(f"Adaptive Graph: inspecting {len(raw_clusters)} clusters. Split limit={max_size_before_split}.")
+
+    for cluster in tqdm(raw_clusters, desc="Adaptive refinement", disable=(config.misc.log_level != "default")):
+        if getattr(config.misc, "log_level", "") == "debug":
+            LOGGER.debug(f"[adaptive_graph] cluster_size={len(cluster)}")
+        if len(cluster) <= max_size_before_split:
+            if len(cluster) >= min_size:
+                final_clusters.append(cluster)
+            else:
+                discarded.extend(cluster)
+            continue
+
+        indices = np.array(cluster, dtype=int)
+        sub_feats = feats[indices]
+        m = len(indices)
+        sub_adj: List[List[int]] = [[] for _ in range(m)]
+
+        sf = sub_feats.astype(np.float32, copy=False)
+        sq_norms = np.sum(sf ** 2, axis=1)
+        d2 = sq_norms[:, None] + sq_norms[None, :] - 2.0 * (sf @ sf.T)
+        np.maximum(d2, 0.0, out=d2)
+
+        for i_loc in range(m):
+            for j_loc in range(i_loc + 1, m):
+                if d2[i_loc, j_loc] <= strict_threshold_sq:
+                    sub_adj[i_loc].append(j_loc)
+                    sub_adj[j_loc].append(i_loc)
+
+        sub_visited = np.zeros(m, dtype=bool)
+        split_parts: List[List[int]] = []
+        noise_part: List[int] = []
+
+        for i_loc in range(m):
+            if sub_visited[i_loc]:
+                continue
+            if not sub_adj[i_loc]:
+                sub_visited[i_loc] = True
+                noise_part.append(int(indices[i_loc]))
+                continue
+            q = deque([i_loc])
+            sub_visited[i_loc] = True
+            sub_comp: List[int] = []
+            while q:
+                u_loc = q.popleft()
+                sub_comp.append(int(indices[u_loc]))
+                for v_loc in sub_adj[u_loc]:
+                    if not sub_visited[v_loc]:
+                        sub_visited[v_loc] = True
+                        q.append(v_loc)
+            split_parts.append(sub_comp)
+
+        valid_splits = [c for c in split_parts if len(c) >= min_size]
+
+        if len(valid_splits) > 0:
+            final_clusters.extend(valid_splits)
+            discarded.extend(noise_part)
+            for c in split_parts:
+                if len(c) < min_size:
+                    discarded.extend(c)
+        else:
+            discarded.extend(cluster)
+
+    LOGGER.info(f"Adaptive summary: {len(final_clusters)} clusters final.")
+    return ClusterResult(clusters=final_clusters, discarded=discarded)
+
+
+def refine_clusters_structure(clusters: List[List[int]], feats: np.ndarray, config: Config) -> ClusterResult:
+    """
+    Post-process clusters: MST splitting, Pruning, and RESCUE of dense cores from garbage.
+    """
+    try:
+        import scipy.spatial.distance as sdist
+        from scipy.sparse import csr_matrix, coo_matrix  # type: ignore
+        from scipy.sparse.csgraph import minimum_spanning_tree, connected_components  # type: ignore
+    except Exception as exc:  # pragma: no cover
+        LOGGER.error(f"Refine requested but SciPy is unavailable: {exc}. Skipping refinement.")
+        return ClusterResult(clusters=clusters, discarded=[])
+
+    final_clusters: List[List[int]] = []
+    discarded: List[int] = []
+
+    # --- Настройки ---
+    min_size = int(config.clustering.min_size)
+    global_threshold = float(config.clustering.threshold)
+    
+    # MST Split Ratio
+    # Если поставить слишком мало (1.5), будет дробить всё подряд.
+    # Если слишком много (3.0), пропустит склейки (ваша проблема).
+    # Вернем разумный баланс, так как теперь у нас есть Rescue Mode.
+    split_ratio = 2.0 
+    
+    outlier_sigma = 1.8        
+    garbage_density_ratio = 0.6
+    
+    # Порог спасения: если внутри "мусора" есть точки ближе чем эта дистанция, это ядро.
+    # 0.7 от 0.47 = 0.33. Ваша пара (0.15) легко пройдет.
+    rescue_threshold_ratio = 0.75
+
+    safe_size = 1
+    is_debug = getattr(config.misc, "log_level", "") == "debug"
+    show_progress = config.misc.log_level == "default"
+
+    def _recursive_mst_split(indices: List[int], sub_feats: np.ndarray) -> List[List[int]]:
+        m = len(indices)
+        if m < safe_size:
+            return [indices]
+
+        dists = sdist.pdist(sub_feats, metric="euclidean")
+        if dists.size == 0: return [indices]
+        
+        d_mat = sdist.squareform(dists)
+        tree = minimum_spanning_tree(csr_matrix(d_mat))
+        rows, cols = tree.nonzero()
+        data = tree.data
+
+        if len(data) == 0: return [indices]
+
+        mean_weight = float(np.mean(data))
+        threshold_edge = mean_weight * split_ratio
+        max_idx = int(np.argmax(data))
+        max_val = float(data[max_idx])
+
+        if max_val > threshold_edge and max_val > 1e-4:
+            # Cut logic
+            mask = np.ones(len(data), dtype=bool)
+            mask[max_idx] = False
+            new_graph = coo_matrix((data[mask], (rows[mask], cols[mask])), shape=(m, m))
+            n_comps, labels = connected_components(new_graph, directed=False)
+            parts = []
+            for comp_id in range(n_comps):
+                comp_local = np.where(labels == comp_id)[0]
+                comp_global = [indices[k] for k in comp_local]
+                parts.extend(_recursive_mst_split(comp_global, sub_feats[comp_local]))
+            return parts
+        return [indices]
+
+    def _prune_outliers(indices: List[int]) -> Tuple[List[int], List[int]]:
+        if len(indices) < safe_size:
+            return indices, []
+        sub_feats = feats[np.array(indices, dtype=int)].astype(np.float32, copy=False)
+        centroid = np.mean(sub_feats, axis=0)
+        dists = np.linalg.norm(sub_feats - centroid, axis=1)
+        mean_d, std_d = float(np.mean(dists)), float(np.std(dists))
+        if std_d < 1e-6: return indices, []
+        
+        limit = mean_d + (outlier_sigma * std_d)
+        keep, toss = [], []
+        for i, d in enumerate(dists):
+            (keep if d <= limit else toss).append(indices[i])
+        return keep, toss
+
+    def _rescue_dense_cores(indices: List[int]) -> Tuple[List[List[int]], List[int]]:
+        """
+        Пытается найти плотные ядра внутри кластера, который был помечен как 'garbage'.
+        Использует Connected Components с жестким порогом.
+        """
+        m = len(indices)
+        if m < min_size: 
+            return [], indices
+
+        sub_feats = feats[np.array(indices, dtype=int)].astype(np.float32, copy=False)
+        
+        # Вычисляем полную матрицу расстояний для подмножества
+        # Для m < 1000 это очень быстро
+        diff = sub_feats[:, None, :] - sub_feats[None, :, :]
+        # dist matrix
+        d_mat = np.sqrt(np.sum(diff**2, axis=2))
+        
+        # Строгий порог
+        strict_thr = global_threshold * rescue_threshold_ratio
+        
+        # Строим граф: ребро есть, только если дистанция < strict_thr
+        adj_matrix = (d_mat <= strict_thr).astype(int)
+        # Убираем диагональ (хотя для connected_components не критично)
+        np.fill_diagonal(adj_matrix, 0)
+        
+        # Ищем компоненты
+        n_comps, labels = connected_components(csr_matrix(adj_matrix), directed=False)
+        
+        saved_clusters = []
+        true_trash = []
+        
+        for comp_id in range(n_comps):
+            comp_local = np.where(labels == comp_id)[0]
+            if len(comp_local) >= min_size:
+                comp_global = [indices[k] for k in comp_local]
+                saved_clusters.append(comp_global)
+            else:
+                for k in comp_local:
+                    true_trash.append(indices[k])
+                    
+        return saved_clusters, true_trash
+
+    # --- MAIN LOOP ---
+    for cluster in tqdm(clusters, desc="Refining structure", disable=not show_progress):
+        if len(cluster) < min_size:
+            discarded.extend(cluster)
+            continue
+
+        # 1. MST Split
+        sub_feats = feats[np.array(cluster, dtype=int)].astype(np.float32, copy=False)
+        parts = _recursive_mst_split(cluster, sub_feats)
+        
+        for part in parts:
+            if len(part) < min_size:
+                discarded.extend(part)
+                continue
+
+            # 2. Outlier Pruning
+            cleaned, outliers = _prune_outliers(part)
+            discarded.extend(outliers)
+            
+            if len(cleaned) < min_size:
+                discarded.extend(cleaned)
+                continue
+
+            # 3. Garbage / Density Check
+            p_feats = feats[np.array(cleaned, dtype=int)].astype(np.float32, copy=False)
+            centroid = np.mean(p_feats, axis=0)
+            avg_dist = float(np.mean(np.linalg.norm(p_feats - centroid, axis=1)))
+            
+            is_garbage = False
+            limit_radius = global_threshold * garbage_density_ratio
+            
+            # Для микро-кластеров даем поблажку по радиусу, если они выжили MST
+            threshold_check = limit_radius if len(cleaned) >= safe_size else (limit_radius * 1.5)
+
+            if global_threshold > 0.0 and avg_dist > threshold_check:
+                is_garbage = True
+
+            if is_garbage:
+                # ВМЕСТО ТОГО ЧТОБЫ ВЫКИДЫВАТЬ, ЗАПУСКАЕМ СПАСАТЕЛЬНУЮ ОПЕРАЦИЮ
+                if is_debug:
+                    LOGGER.debug(f"[refine-garbage] Blob detected (avg_rad={avg_dist:.3f}). Attempting rescue...")
+                
+                rescued_cores, hopeless_trash = _rescue_dense_cores(cleaned)
+                
+                if rescued_cores:
+                    if is_debug:
+                        LOGGER.debug(f"[refine-rescue] SAVED {len(rescued_cores)} dense cores from garbage!")
+                    final_clusters.extend(rescued_cores)
+                
+                discarded.extend(hopeless_trash)
+            else:
+                final_clusters.append(cleaned)
+
+    LOGGER.info(
+        f"Refine summary: {len(final_clusters)} clusters kept, {len(discarded)} items discarded."
+    )
+    return ClusterResult(clusters=final_clusters, discarded=discarded)
+
 def _resolve_save_mode(config: Config) -> str:
     raw_mode = str(getattr(config.clustering, "save_mode", "default")).lower()
     if raw_mode not in {"default", "json", "print", "group_filling", "cluster_sort"}:
@@ -702,7 +1437,7 @@ def _export_group_filling(
         split_mode = "recluster"
 
     prepared = _prepare_group_filling_clusters(result.clusters, feats, config, group_size, split_mode)
-    prepared = _sort_clusters_by_embedding(prepared, feats, config)
+    # prepared = _sort_clusters_by_embedding(prepared, feats, config)
 
     all_discards = list(result.discarded if save_discarded else [])
     groups_seq_order = _build_cluster_groups(prepared, group_size, by_size_desc=False)
@@ -892,36 +1627,36 @@ def _placement_cost(
             
             # Case C: Remainder <= half group_size
             # Spec: Prioritize balanced tails (e.g. 5+10+6 > 1+10+10)
-            elif rem <= group_size / 2:
-                # Calculate Left Group Partial (items in the first group)
-                # If start is 12 (group 10-19), items are 12..19 -> 8 items.
-                offset_in_group = start % group_size
-                left_partial = group_size - offset_in_group
-                # Verify left_partial isn't larger than total length (shouldn't happen here but safe)
-                left_partial = min(left_partial, length)
-                
-                remaining = length - left_partial
-                
-                # Calculate Right Group Partial (items in the last group)
-                if remaining > 0:
-                    right_partial = remaining % group_size
-                    # If modulo is 0, it means it fills the last group completely? 
-                    # No, rem <= half.
-                    # Example: Len 21, Start 12 (group 10).
-                    # Left=8 (12-19). Rem=13. 
-                    # Next group (20-29) takes 10. Rem=3.
-                    # Last group takes 3. right_partial=3.
-                    if right_partial == 0 and remaining >= group_size:
-                         # It ended exactly on boundary
-                         right_partial = group_size
-                else:
-                    right_partial = 0 # Should not happen if length > group size
-                
-                # Formula: base + clamp(((L-R)^2)/150 - 0.16, 0.0, 1.0)
-                diff = left_partial - right_partial
-                penalty = ((diff ** 2) / 150.0) - 0.16
-                penalty = max(0.0, min(1.0, penalty))
-                cost += penalty
+                                                                            # elif rem <= group_size / 2:
+            # Calculate Left Group Partial (items in the first group)
+            # If start is 12 (group 10-19), items are 12..19 -> 8 items.
+            offset_in_group = start % group_size
+            left_partial = group_size - offset_in_group
+            # Verify left_partial isn't larger than total length (shouldn't happen here but safe)
+            left_partial = min(left_partial, length)
+            
+            remaining = length - left_partial
+            
+            # Calculate Right Group Partial (items in the last group)
+            if remaining > 0:
+                right_partial = remaining % group_size
+                # If modulo is 0, it means it fills the last group completely? 
+                # No, rem <= half.
+                # Example: Len 21, Start 12 (group 10).
+                # Left=8 (12-19). Rem=13. 
+                # Next group (20-29) takes 10. Rem=3.
+                # Last group takes 3. right_partial=3.
+                if right_partial == 0 and remaining >= group_size:
+                        # It ended exactly on boundary
+                        right_partial = group_size
+            else:
+                right_partial = 0 # Should not happen if length > group size
+            
+            # Formula: base + clamp(((L-R)^2)/150 - 0.1, 0.0, 1.0)
+            diff = left_partial - right_partial
+            penalty = ((diff ** 2) / 150.0) - 0.1
+            penalty = max(0.0, min(1.0, penalty))
+            cost += penalty
 
     # 3. Distance from desired position penalty (to avoid drifting too far)
     # Using a small weight to break ties in favor of the intended position
@@ -1022,7 +1757,7 @@ def _export_cluster_sort(
     if group_size <= 0:
         group_size = 10
     naming_mode = getattr(config.clustering, "naming_mode", "default")
-    use_centroid = bool(getattr(config.clustering, "cluster_sort_use_centroid", False))
+    use_centroid = bool(getattr(config.clustering, "cluster_sort_use_centroid", True))
 
     # Map original cluster id for naming/contiguity
     cluster_id_map: Dict[int, int] = {}
@@ -1031,10 +1766,22 @@ def _export_cluster_sort(
             cluster_id_map[int(idx)] = int(cid)
 
     # 1. Internal sorting of clusters
-    prepared: List[List[int]] = []
-    for cl in result.clusters:
-        ordered = _order_cluster_items(list(cl), feats, config)
-        prepared.append(ordered)
+    clusters_seq = list(result.clusters)
+    cluster_count = len(clusters_seq)
+
+    def _order_single(cluster: Sequence[int]) -> List[int]:
+        return _order_cluster_items(list(cluster), feats, config)
+
+    prepared: List[List[int]]
+    if cluster_count == 0:
+        prepared = []
+    else:
+        max_workers = max(1, min(cluster_count, os.cpu_count() or 1))
+        if max_workers == 1:
+            prepared = [_order_single(cl) for cl in clusters_seq]
+        else:
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                prepared = list(executor.map(_order_single, clusters_seq))
 
     # 2. Internal sorting of discarded (base sequence)
     base_seq = _order_discarded(list(result.discarded), feats, config)

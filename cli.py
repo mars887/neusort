@@ -74,7 +74,7 @@ CLI_SPEC: List[Dict[str, Any]] = [
                 "type": "str",
                 "dest": "algorithm",
                 "default": "distance",
-                "choices": ["distance", "hdbscan", "dbscan", "cc_graph", "mutual_graph"],
+                "choices": ["distance", "hdbscan", "dbscan", "cc_graph", "mutual_graph", "agglomerative", "agglomerative_complete", "optics", "snn", "rank_mutual", "adaptive_graph"],
                 "help": "Clustering backend.",
             },
             "cluster_pca": {
@@ -105,6 +105,13 @@ CLI_SPEC: List[Dict[str, Any]] = [
                 "dest": "cluster_similar_fill",
                 "default": False,
                 "help": "Prefer fillers that are closest to the current group centroid.",
+            },
+            "enable_refine": {
+                "names": ["enable_refine", "refine_clusters"],
+                "type": "bool",
+                "dest": "cluster_enable_refine",
+                "default": False,
+                "help": "Run post-cluster refinement (split/prune/garbage filter).",
             },
         },
     },

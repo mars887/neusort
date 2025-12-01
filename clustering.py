@@ -1223,17 +1223,15 @@ def cluster_by_adaptive_graph(feats: np.ndarray, config: Config, use_gpu: bool) 
 def refine_clusters_structure(clusters: List[List[int]], feats: np.ndarray, config: Config) -> ClusterResult:
     """
     Post-process clusters: MST splitting, Pruning, and RESCUE of dense cores from garbage.
+    Parallelized version.
     """
     try:
         import scipy.spatial.distance as sdist
-        from scipy.sparse import csr_matrix, coo_matrix  # type: ignore
-        from scipy.sparse.csgraph import minimum_spanning_tree, connected_components  # type: ignore
+        from scipy.sparse import csr_matrix, coo_matrix
+        from scipy.sparse.csgraph import minimum_spanning_tree, connected_components
     except Exception as exc:  # pragma: no cover
         LOGGER.error(f"Refine requested but SciPy is unavailable: {exc}. Skipping refinement.")
         return ClusterResult(clusters=clusters, discarded=[])
-
-    final_clusters: List[List[int]] = []
-    discarded: List[int] = []
 
     # --- Настройки ---
     min_size = int(config.clustering.min_size)
@@ -1243,16 +1241,15 @@ def refine_clusters_structure(clusters: List[List[int]], feats: np.ndarray, conf
     # Если поставить слишком мало (1.5), будет дробить всё подряд.
     # Если слишком много (3.0), пропустит склейки (ваша проблема).
     # Вернем разумный баланс, так как теперь у нас есть Rescue Mode.
-    split_ratio = 2.0 
-    
-    outlier_sigma = 1.8        
+    split_ratio = 2.4 
+    outlier_sigma = 2.0        
     garbage_density_ratio = 0.6
     
     # Порог спасения: если внутри "мусора" есть точки ближе чем эта дистанция, это ядро.
     # 0.7 от 0.47 = 0.33. Ваша пара (0.15) легко пройдет.
     rescue_threshold_ratio = 0.75
+    safe_size = 1 # Используем 1, чтобы фильтрация шла внутри функций, или 5 для скорости
 
-    safe_size = 1
     is_debug = getattr(config.misc, "log_level", "") == "debug"
     show_progress = config.misc.log_level == "default"
 
@@ -1316,18 +1313,19 @@ def refine_clusters_structure(clusters: List[List[int]], feats: np.ndarray, conf
 
         sub_feats = feats[np.array(indices, dtype=int)].astype(np.float32, copy=False)
         
-        # Вычисляем полную матрицу расстояний для подмножества
-        # Для m < 1000 это очень быстро
-        diff = sub_feats[:, None, :] - sub_feats[None, :, :]
-        # dist matrix
-        d_mat = np.sqrt(np.sum(diff**2, axis=2))
+        # Оптимизация памяти: ||a-b||^2 = ||a||^2 + ||b||^2 - 2<a,b>
+        # Это избегает создания 3D тензора (N, N, D), который ест память при больших m
+        sq_norms = np.sum(sub_feats**2, axis=1)
+        # d^2
+        d2 = sq_norms[:, None] + sq_norms[None, :] - 2 * (sub_feats @ sub_feats.T)
+        # Из-за флоат погрешности могут быть -0.0
+        np.maximum(d2, 0.0, out=d2)
         
-        # Строгий порог
-        strict_thr = global_threshold * rescue_threshold_ratio
+        # Строгий порог (в квадрате, чтобы не брать корень от матрицы)
+        strict_thr_sq = (global_threshold * rescue_threshold_ratio) ** 2
         
-        # Строим граф: ребро есть, только если дистанция < strict_thr
-        adj_matrix = (d_mat <= strict_thr).astype(int)
-        # Убираем диагональ (хотя для connected_components не критично)
+        # Строим граф: ребро есть, только если дистанция^2 < strict_thr^2
+        adj_matrix = (d2 <= strict_thr_sq).astype(int)
         np.fill_diagonal(adj_matrix, 0)
         
         # Ищем компоненты
@@ -1347,11 +1345,13 @@ def refine_clusters_structure(clusters: List[List[int]], feats: np.ndarray, conf
                     
         return saved_clusters, true_trash
 
-    # --- MAIN LOOP ---
-    for cluster in tqdm(clusters, desc="Refining structure", disable=not show_progress):
+    def _process_single_cluster(cluster: List[int]) -> Tuple[List[List[int]], List[int]]:
+        """Обработка одного кластера для запуска в потоке."""
+        local_final = []
+        local_discarded = []
+
         if len(cluster) < min_size:
-            discarded.extend(cluster)
-            continue
+            return [], list(cluster)
 
         # 1. MST Split
         sub_feats = feats[np.array(cluster, dtype=int)].astype(np.float32, copy=False)
@@ -1359,46 +1359,75 @@ def refine_clusters_structure(clusters: List[List[int]], feats: np.ndarray, conf
         
         for part in parts:
             if len(part) < min_size:
-                discarded.extend(part)
+                local_discarded.extend(part)
                 continue
 
             # 2. Outlier Pruning
             cleaned, outliers = _prune_outliers(part)
-            discarded.extend(outliers)
+            local_discarded.extend(outliers)
             
             if len(cleaned) < min_size:
-                discarded.extend(cleaned)
+                local_discarded.extend(cleaned)
                 continue
 
             # 3. Garbage / Density Check
             p_feats = feats[np.array(cleaned, dtype=int)].astype(np.float32, copy=False)
             centroid = np.mean(p_feats, axis=0)
+            # Для проверки мусора не обязательно считать pdist, достаточно радиуса от центра
             avg_dist = float(np.mean(np.linalg.norm(p_feats - centroid, axis=1)))
             
             is_garbage = False
             limit_radius = global_threshold * garbage_density_ratio
-            
-            # Для микро-кластеров даем поблажку по радиусу, если они выжили MST
-            threshold_check = limit_radius if len(cleaned) >= safe_size else (limit_radius * 1.5)
+            threshold_check = limit_radius if len(cleaned) >= max(5, min_size + 1) else (limit_radius * 1.5)
 
             if global_threshold > 0.0 and avg_dist > threshold_check:
                 is_garbage = True
 
             if is_garbage:
-                # ВМЕСТО ТОГО ЧТОБЫ ВЫКИДЫВАТЬ, ЗАПУСКАЕМ СПАСАТЕЛЬНУЮ ОПЕРАЦИЮ
                 if is_debug:
-                    LOGGER.debug(f"[refine-garbage] Blob detected (avg_rad={avg_dist:.3f}). Attempting rescue...")
+                    # В многопотоке логи могут перемешиваться, но для дебага сойдет
+                    LOGGER.debug(f"[refine-garbage] Rescue needed (avg_rad={avg_dist:.3f}).")
                 
                 rescued_cores, hopeless_trash = _rescue_dense_cores(cleaned)
-                
                 if rescued_cores:
-                    if is_debug:
-                        LOGGER.debug(f"[refine-rescue] SAVED {len(rescued_cores)} dense cores from garbage!")
-                    final_clusters.extend(rescued_cores)
-                
-                discarded.extend(hopeless_trash)
+                    local_final.extend(rescued_cores)
+                local_discarded.extend(hopeless_trash)
             else:
-                final_clusters.append(cleaned)
+                local_final.append(cleaned)
+                
+        return local_final, local_discarded
+
+    # --- MAIN PARALLEL LOOP ---
+    final_clusters: List[List[int]] = []
+    discarded: List[int] = []
+    
+    # Определяем кол-во потоков
+    max_workers = os.cpu_count() or 1
+    # Если кластеров мало, не создаем лишние потоки
+    max_workers = min(max_workers, len(clusters))
+    
+    if max_workers <= 1:
+        # Синхронный режим
+        iterator = tqdm(clusters, desc="Refining structure", disable=not show_progress)
+        for cl in iterator:
+            f, d = _process_single_cluster(cl)
+            final_clusters.extend(f)
+            discarded.extend(d)
+    else:
+        # Асинхронный режим
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # map сохраняет порядок, но нам он не критичен здесь, 
+            # однако для прогресс-бара лучше использовать as_completed или list(tqdm(...))
+            results = list(tqdm(
+                executor.map(_process_single_cluster, clusters), 
+                total=len(clusters), 
+                desc="Refining structure (MT)", 
+                disable=not show_progress
+            ))
+            
+            for f, d in results:
+                final_clusters.extend(f)
+                discarded.extend(d)
 
     LOGGER.info(
         f"Refine summary: {len(final_clusters)} clusters kept, {len(discarded)} items discarded."
@@ -1745,6 +1774,124 @@ def _build_sequence_names(
             names.append(f"{fmt.format(i)}_{basename}{ext}")
     return names
 
+def _precompute_base_stats(base_seq: List[int], feats: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Pre-calculate vectors and gap distances for the base sequence to speed up CLi lookup.
+    """
+    if not base_seq:
+        return np.zeros((0, feats.shape[1]), dtype=np.float32), np.zeros((0,), dtype=np.float32)
+    
+    # 1. Матрица векторов для base_seq (N_base x Dim)
+    base_vecs = feats[np.array(base_seq, dtype=int)].astype(np.float32, copy=False)
+    
+    # 2. Дистанции между соседями i и i+1 в base_seq (Gap costs)
+    # Это те "мостики", которые мы разрываем при вставке.
+    # Cost = ||L - C|| + ||R - C|| - ||L - R||
+    # Вот этот ||L - R|| мы считаем заранее.
+    if len(base_seq) > 1:
+        diffs = base_vecs[:-1] - base_vecs[1:]
+        gap_dists = np.linalg.norm(diffs, axis=1)
+    else:
+        gap_dists = np.zeros((0,), dtype=np.float32)
+        
+    return base_vecs, gap_dists
+
+
+def _compute_cluster_cli_vectorized(
+    items: List[int],
+    base_vecs: np.ndarray,
+    base_gap_dists: np.ndarray,
+    feats: np.ndarray,
+    use_centroid: bool,
+) -> Tuple[int, List[int], float, np.ndarray]:
+    """
+    Vectorized version of CLi computation.
+    Instead of iterating position by position (Python loop), uses NumPy broadcasting.
+    """
+    # 1. Определяем "представителя" кластера
+    if use_centroid or len(items) == 0:
+        centroid = _cluster_embedding(items, feats)
+        # Для центроида ориентация не важна, считаем один раз
+        # Dists from centroid to ALL base items at once
+        # (N_base,)
+        dists_to_base = np.linalg.norm(base_vecs - centroid, axis=1)
+        
+        # Orientations
+        c_start_dists = dists_to_base
+        c_end_dists = dists_to_base
+        centroid_obj = centroid
+    else:
+        # Edge mode: берем первый и последний элементы
+        vec_start = feats[int(items[0])].astype(np.float32, copy=False)
+        vec_end = feats[int(items[-1])].astype(np.float32, copy=False)
+        
+        c_start_dists = np.linalg.norm(base_vecs - vec_start, axis=1)
+        c_end_dists = np.linalg.norm(base_vecs - vec_end, axis=1)
+        centroid_obj = _cluster_embedding(items, feats) # Просто для возврата
+
+    n_base = len(base_vecs)
+    if n_base == 0:
+        return 0, items, 0.0, centroid_obj
+
+    # 2. Вычисляем стоимость вставки для всех позиций РАЗОМ
+    # Позиций вставки n_base + 1 (от 0 до n_base)
+    #
+    # Cost[i] (вставка между i-1 и i) = 
+    #   Dist(Base[i-1], Cluster_Left) + 
+    #   Dist(Base[i], Cluster_Right) - 
+    #   Gap(Base[i-1], Base[i])
+    
+    # Подготовим массивы для "Left neighbor" и "Right neighbor"
+    # Для позиций в середине (от 1 до n_base-1):
+    # Left neighbors indices: 0..(n-2)
+    # Right neighbors indices: 1..(n-1)
+    
+    # --- Forward Orientation (items as is) ---
+    # Left connects to items[0] (c_start), Right connects to items[-1] (c_end)
+    
+    # Стоимость для внутренних позиций (индексы вставки 1..n-1)
+    # base_gap_dists[k] corresponds to gap between k and k+1
+    mid_costs_fwd = (
+        c_start_dists[:-1] +   # Dist(Base[i-1], Cluster_Start)
+        c_end_dists[1:] -      # Dist(Base[i], Cluster_End)
+        base_gap_dists         # Dist(Base[i-1], Base[i])
+    )
+    
+    # Стоимость для краев
+    # Pos 0: Left=None. Cost = Dist(Base[0], Cluster_Right)
+    cost_start_fwd = c_end_dists[0]
+    # Pos N: Right=None. Cost = Dist(Base[-1], Cluster_Left)
+    cost_end_fwd = c_start_dists[-1]
+    
+    # --- Reverse Orientation (reversed(items)) ---
+    # Cluster is flipped: Start is now items[-1], End is items[0]
+    # Left connects to items[-1] (c_end), Right connects to items[0] (c_start)
+    
+    mid_costs_rev = (
+        c_end_dists[:-1] + 
+        c_start_dists[1:] - 
+        base_gap_dists
+    )
+    cost_start_rev = c_start_dists[0]
+    cost_end_rev = c_end_dists[-1]
+    
+    # 3. Находим минимум
+    # Собираем полные массивы стоимостей
+    # [Start, ...Mid..., End]
+    
+    costs_fwd = np.concatenate(([cost_start_fwd], mid_costs_fwd, [cost_end_fwd]))
+    costs_rev = np.concatenate(([cost_start_rev], mid_costs_rev, [cost_end_rev]))
+    
+    min_idx_fwd = np.argmin(costs_fwd)
+    min_val_fwd = costs_fwd[min_idx_fwd]
+    
+    min_idx_rev = np.argmin(costs_rev)
+    min_val_rev = costs_rev[min_idx_rev]
+    
+    if min_val_fwd <= min_val_rev:
+        return int(min_idx_fwd), items, float(min_val_fwd), centroid_obj
+    else:
+        return int(min_idx_rev), list(reversed(items)), float(min_val_rev), centroid_obj
 
 def _export_cluster_sort(
     paths: Sequence[str],
@@ -1758,6 +1905,7 @@ def _export_cluster_sort(
         group_size = 10
     naming_mode = getattr(config.clustering, "naming_mode", "default")
     use_centroid = bool(getattr(config.clustering, "cluster_sort_use_centroid", True))
+    show_progress = True
 
     # Map original cluster id for naming/contiguity
     cluster_id_map: Dict[int, int] = {}
@@ -1786,24 +1934,52 @@ def _export_cluster_sort(
     # 2. Internal sorting of discarded (base sequence)
     base_seq = _order_discarded(list(result.discarded), feats, config)
     feats_cache = feats.astype(np.float32, copy=False)
+    
+    # --- ОПТИМИЗАЦИЯ: Векторный расчет CLi ---
+    
+    # A. Пре-калькуляция данных базовой последовательности (делается 1 раз)
+    # Это переносит нагрузку с Python Loop на C++ NumPy
+    base_vecs, base_gaps = _precompute_base_stats(base_seq, feats)
 
-    # 3. Calculate CLi (Optimal insertion index) for each cluster against the base sequence
-    #    We do this BEFORE any insertions.
-    cluster_structs = []
-    for pid, cl in enumerate(prepared):
-        items = list(cl)
-        # Find best spot in the *original* base_seq
-        best_pos, best_oriented, best_cost, centroid = _compute_cluster_cli(items, base_seq, feats_cache, use_centroid)
-        cluster_structs.append(
-            {
-                "pid": pid,
-                "items": best_oriented,
-                "best_pos": best_pos, # Target index relative to base_seq
-                "best_cost": best_cost,
-                "orig_size": len(items),
-                "centroid": centroid,
-            }
+    # B. Расчет позиций для каждого кластера
+    # Теперь функция _compute_cluster_cli_vectorized выполняется очень быстро,
+    # так как внутри неё нет циклов, только матричная алгебра.
+    
+    def _calc_cli_job_vectorized(args):
+        pid, items = args
+        best_pos, best_oriented, best_cost, centroid = _compute_cluster_cli_vectorized(
+            items, base_vecs, base_gaps, feats, use_centroid
         )
+        return {
+            "pid": pid,
+            "items": best_oriented,
+            "best_pos": best_pos,
+            "best_cost": best_cost,
+            "orig_size": len(items),
+            "centroid": centroid,
+        }
+
+    job_args = [(pid, list(cl)) for pid, cl in enumerate(prepared)]
+    
+    # Запускаем многопоточность.
+    # Так как мы сняли блокировку GIL внутри math-операций, 
+    # потоки теперь будут реально нагружать CPU на 100%.
+    cluster_count = len(job_args)
+    max_workers = max(1, min(cluster_count, os.cpu_count() or 1))
+
+    if cluster_count > 0:
+        if max_workers <= 1:
+            cluster_structs = [_calc_cli_job_vectorized(args) for args in tqdm(job_args, desc="Calc CLi (Vec)", disable=not show_progress)]
+        else:
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                cluster_structs = list(tqdm(
+                    executor.map(_calc_cli_job_vectorized, job_args),
+                    total=cluster_count,
+                    desc="Calc CLi (Vec+MT)",
+                    disable=not show_progress
+                ))
+    else:
+        cluster_structs = []
 
     # Sort clusters by their target insertion index (CLi)
     cluster_structs.sort(key=lambda c: (c["best_pos"], c["best_cost"]))

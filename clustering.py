@@ -137,8 +137,8 @@ def _compute_cluster_distances(
 
     # Progress over block pairs roughly proportional to (n/bs)^2
     steps_i = (n + bs - 1) // bs
-    show_progress = True  # caller decides via surrounding config; here we always show
-    progress = tqdm(total=steps_i, desc="Cluster distances (stream)")
+    show_progress = LOGGER.lvlp(2)
+    progress = tqdm(total=steps_i, desc="Cluster distances (stream)", disable=not show_progress)
 
     for i0 in range(0, n, bs):
         i1 = min(n, i0 + bs)
@@ -196,7 +196,7 @@ def _copy_with_custom_names(
     os.makedirs(dst_folder, exist_ok=True)
     total = len(indices)
     progress = None
-    if config.misc.log_level == "default" and total > 0:
+    if LOGGER.lvlp(2) and total > 0:
         desc = f"Copying cluster to '{os.path.basename(dst_folder)}'"
         progress = tqdm(total=total, desc=desc)
 
@@ -290,7 +290,7 @@ def _assign_clusters(neighbors: Sequence[set], similarity_ratio: float, config: 
     clusters: List[List[int]] = []
     similarity_ratio = max(0.0, min(1.0, similarity_ratio))
 
-    show_progress = config.misc.log_level == "default"
+    show_progress = LOGGER.lvlp(2)
     iterator = range(len(neighbors))
     progress = tqdm(total=len(neighbors), desc="Greedy clustering", disable=not show_progress)
 
@@ -324,17 +324,15 @@ def cluster_by_distance(feats: np.ndarray, config: Config, use_gpu: bool) -> Clu
     threshold = float(config.clustering.threshold)
     similarity_ratio = float(config.clustering.similarity_ratio)
     min_size = int(config.clustering.min_size)
-    is_debug = getattr(config.misc, "log_level", "") == "debug"
 
-    if is_debug:
-        LOGGER.debug(f"[distance] threshold={threshold:.4f} ratio={similarity_ratio:.3f} min_size={min_size}")
+    LOGGER.debug(f"[distance] threshold={threshold:.4f} ratio={similarity_ratio:.3f} min_size={min_size}")
 
     if threshold <= 0.0:
         LOGGER.error("Clustering threshold must be positive. No clusters will be produced.")
         return ClusterResult(clusters=[], discarded=list(range(feats.shape[0])))
 
     neighbors = _build_neighbor_sets(feats, threshold, use_gpu)
-    if is_debug and neighbors:
+    if LOGGER.lvlp(3) and neighbors:
         counts = np.array([len(n) for n in neighbors], dtype=np.int32)
         LOGGER.debug(
             f"[distance] neighbor stats -> min={int(counts.min())}, mean={float(np.mean(counts)):.2f}, "
@@ -378,8 +376,6 @@ def cluster_by_hdbscan(feats: np.ndarray, config: Config) -> ClusterResult:
     if n == 0:
         return ClusterResult(clusters=[], discarded=[])
 
-    is_debug = getattr(config.misc, "log_level", "") == "debug"
-
     if hdbscan is None:
         LOGGER.error("HDBSCAN is not installed. Falling back to distance-based clustering.")
         # Fallback to distance-based clustering in CPU mode for safety
@@ -387,8 +383,7 @@ def cluster_by_hdbscan(feats: np.ndarray, config: Config) -> ClusterResult:
 
     feats32 = feats.astype(np.float32, copy=False)
     min_cluster_size = max(1, int(config.clustering.min_size))
-    if is_debug:
-        LOGGER.debug(f"[hdbscan] samples={n} min_cluster_size={min_cluster_size} dim={feats32.shape[1]}")
+    LOGGER.debug(f"[hdbscan] samples={n} min_cluster_size={min_cluster_size} dim={feats32.shape[1]}")
 
     # Configure HDBSCAN with a robust default; `min_samples=None` => equals `min_cluster_size`.
     clusterer = hdbscan.HDBSCAN(
@@ -399,7 +394,7 @@ def cluster_by_hdbscan(feats: np.ndarray, config: Config) -> ClusterResult:
     )
 
     # Show a minimal progress indicator as HDBSCAN runs internally.
-    show_progress = config.misc.log_level == "default"
+    show_progress = LOGGER.lvlp(2)
     progress = tqdm(total=1, desc="HDBSCAN fit", disable=not show_progress)
     labels = clusterer.fit_predict(feats32)
     if progress:
@@ -422,8 +417,7 @@ def cluster_by_hdbscan(feats: np.ndarray, config: Config) -> ClusterResult:
             f"HDBSCAN summary: {len(clusters)} clusters, "
             f"size min={int(sizes.min())}, median={int(np.median(sizes))}, max={int(sizes.max())}."
         )
-        if is_debug:
-            LOGGER.debug(f"[hdbscan] noise={len(discarded)}")
+        LOGGER.debug(f"[hdbscan] noise={len(discarded)}")
     else:
         LOGGER.info("HDBSCAN summary: no clusters were produced.")
 
@@ -485,8 +479,7 @@ def cluster_by_agglomerative(feats: np.ndarray, config: Config) -> ClusterResult
             f"Agglomerative summary: {len(valid_clusters)} clusters, "
             f"size min={int(sizes.min())}, median={int(np.median(sizes))}, max={int(sizes.max())}."
         )
-        if getattr(config.misc, "log_level", "") == "debug":
-            LOGGER.debug(f"[agglomerative] label_count={len(clusters_dict)} discarded={len(discarded)}")
+        LOGGER.debug(f"[agglomerative] label_count={len(clusters_dict)} discarded={len(discarded)}")
     else:
         LOGGER.info("Agglomerative summary: no clusters satisfied the minimum size requirement.")
 
@@ -512,8 +505,7 @@ def cluster_by_optics(feats: np.ndarray, config: Config) -> ClusterResult:
         max_eps = np.inf
 
     feats32 = feats.astype(np.float32, copy=False)
-    if getattr(config.misc, "log_level", "") == "debug":
-        LOGGER.debug(f"[optics] samples={n} min_samples={min_samples} max_eps={max_eps}")
+    LOGGER.debug(f"[optics] samples={n} min_samples={min_samples} max_eps={max_eps}")
     model = SklearnOPTICS(
         min_samples=min_samples,
         max_eps=max_eps,
@@ -608,8 +600,7 @@ def cluster_by_agglomerative_complete(feats: np.ndarray, config: Config) -> Clus
             f"Agglomerative (complete) summary: {len(valid_clusters)} clusters, "
             f"size min={int(sizes.min())}, median={int(np.median(sizes))}, max={int(sizes.max())}."
         )
-        if getattr(config.misc, "log_level", "") == "debug":
-            LOGGER.debug(f"[agglomerative_complete] label_count={len(clusters_dict)} discarded={len(discarded)}")
+        LOGGER.debug(f"[agglomerative_complete] label_count={len(clusters_dict)} discarded={len(discarded)}")
     else:
         LOGGER.info("Agglomerative (complete) summary: no clusters satisfied the minimum size requirement.")
 
@@ -639,7 +630,7 @@ def cluster_by_dbscan(feats: np.ndarray, config: Config, use_gpu: bool) -> Clust
     neighbors = _build_neighbor_sets(feats, eps, use_gpu)
 
     min_samples = max(1, int(config.clustering.min_size))
-    if getattr(config.misc, "log_level", "") == "debug" and neighbors:
+    if LOGGER.lvlp(3) and neighbors:
         deg = np.array([len(s) for s in neighbors], dtype=np.int32)
         LOGGER.debug(
             f"[dbscan] eps={eps:.4f} min_samples={min_samples} neighbor deg stats "
@@ -654,7 +645,7 @@ def cluster_by_dbscan(feats: np.ndarray, config: Config, use_gpu: bool) -> Clust
     labels = np.full(n, clustered, dtype=np.int32)
     current_label = 0
 
-    show_progress = config.misc.log_level == "default"
+    show_progress = LOGGER.lvlp(2)
     progress = tqdm(total=n, desc="DBSCAN clustering", disable=not show_progress)
 
     from collections import deque
@@ -738,7 +729,7 @@ def cluster_by_graph(feats: np.ndarray, config: Config, use_gpu: bool) -> Cluste
         return ClusterResult(clusters=[], discarded=list(range(n)))
 
     neighbors = _build_neighbor_sets(feats, eps, use_gpu)
-    if getattr(config.misc, "log_level", "") == "debug" and neighbors:
+    if LOGGER.lvlp(3) and neighbors:
         deg = np.array([len(s) for s in neighbors], dtype=np.int32)
         LOGGER.debug(
             f"[cc_graph] eps={eps:.4f} min_size={config.clustering.min_size} "
@@ -746,7 +737,7 @@ def cluster_by_graph(feats: np.ndarray, config: Config, use_gpu: bool) -> Cluste
         )
 
     # Symmetrize adjacency to form an undirected graph (OR symmetry)
-    show_progress = config.misc.log_level == "default"
+    show_progress = LOGGER.lvlp(2)
     progress_sym = tqdm(total=n, desc="Symmetrizing graph", disable=not show_progress)
     adj = [set(s) for s in neighbors]
     for i in range(n):
@@ -824,7 +815,7 @@ def cluster_by_mutual_graph(feats: np.ndarray, config: Config, use_gpu: bool) ->
         return ClusterResult(clusters=[], discarded=list(range(n)))
 
     neighbors = _build_neighbor_sets(feats, eps, use_gpu)
-    if getattr(config.misc, "log_level", "") == "debug" and neighbors:
+    if LOGGER.lvlp(3) and neighbors:
         deg = np.array([len(s) for s in neighbors], dtype=np.int32)
         LOGGER.debug(
             f"[mutual_graph] eps={eps:.4f} min_size={config.clustering.min_size} "
@@ -921,8 +912,7 @@ def cluster_by_snn(feats: np.ndarray, config: Config, use_gpu: bool) -> ClusterR
     shared_thr = max(1, shared_thr)
 
     LOGGER.info(f"SNN clustering parameters: k={k}, required_shared={shared_thr}")
-    if getattr(config.misc, "log_level", "") == "debug":
-        LOGGER.debug(f"[snn] samples={n} dim={d} k={k} shared_thr={shared_thr}")
+    LOGGER.debug(f"[snn] samples={n} dim={d} k={k} shared_thr={shared_thr}")
 
     feats32 = feats.astype(np.float32, copy=False)
     index_cpu = faiss.IndexFlatL2(d)
@@ -940,7 +930,7 @@ def cluster_by_snn(feats: np.ndarray, config: Config, use_gpu: bool) -> ClusterR
     neighbors_sets = [set(map(int, I[i, 1:])) for i in range(n)]
     adj: List[List[int]] = [[] for _ in range(n)]
 
-    show_progress = config.misc.log_level == "default"
+    show_progress = LOGGER.lvlp(2)
     progress = tqdm(total=n, desc="SNN Graph Build", disable=not show_progress)
 
     for i in range(n):
@@ -1020,8 +1010,7 @@ def cluster_by_rank_mutual(feats: np.ndarray, config: Config, use_gpu: bool) -> 
     k = min(k, max(1, n - 1))
 
     LOGGER.info(f"Rank Mutual Clustering: searching top-{k} neighbors (reciprocal).")
-    if getattr(config.misc, "log_level", "") == "debug":
-        LOGGER.debug(f"[rank_mutual] samples={n} min_size={min_size} k={k} dim={d}")
+    LOGGER.debug(f"[rank_mutual] samples={n} min_size={min_size} k={k} dim={d}")
 
     feats32 = feats.astype(np.float32, copy=False)
     index_cpu = faiss.IndexFlatL2(d)
@@ -1039,7 +1028,7 @@ def cluster_by_rank_mutual(feats: np.ndarray, config: Config, use_gpu: bool) -> 
     neighbor_sets = [set(int(x) for x in I[i, 1:]) for i in range(n)]
     adj: List[List[int]] = [[] for _ in range(n)]
 
-    show_progress = config.misc.log_level == "default"
+    show_progress = LOGGER.lvlp(2)
     progress = tqdm(total=n, desc="Building reciprocal graph", disable=not show_progress)
 
     for i in range(n):
@@ -1117,7 +1106,7 @@ def cluster_by_adaptive_graph(feats: np.ndarray, config: Config, use_gpu: bool) 
         return ClusterResult(clusters=[], discarded=list(range(n)))
 
     neighbors = _build_neighbor_sets(feats, loose_threshold, use_gpu)
-    if getattr(config.misc, "log_level", "") == "debug" and neighbors:
+    if LOGGER.lvlp(3) and neighbors:
         deg = np.array([len(s) for s in neighbors], dtype=np.int32)
         LOGGER.debug(
             f"[adaptive_graph] loose={loose_threshold:.4f} strict_ratio={strict_ratio} split_size>{max_size_before_split} "
@@ -1155,10 +1144,10 @@ def cluster_by_adaptive_graph(feats: np.ndarray, config: Config, use_gpu: bool) 
     strict_threshold_sq = (loose_threshold * strict_ratio) ** 2
 
     LOGGER.info(f"Adaptive Graph: inspecting {len(raw_clusters)} clusters. Split limit={max_size_before_split}.")
+    show_progress = LOGGER.lvlp(2)
 
-    for cluster in tqdm(raw_clusters, desc="Adaptive refinement", disable=(config.misc.log_level != "default")):
-        if getattr(config.misc, "log_level", "") == "debug":
-            LOGGER.debug(f"[adaptive_graph] cluster_size={len(cluster)}")
+    for cluster in tqdm(raw_clusters, desc="Adaptive refinement", disable=not show_progress):
+        LOGGER.debug(f"[adaptive_graph] cluster_size={len(cluster)}")
         if len(cluster) <= max_size_before_split:
             if len(cluster) >= min_size:
                 final_clusters.append(cluster)
@@ -1250,8 +1239,8 @@ def refine_clusters_structure(clusters: List[List[int]], feats: np.ndarray, conf
     rescue_threshold_ratio = 0.75
     safe_size = 1 # Используем 1, чтобы фильтрация шла внутри функций, или 5 для скорости
 
-    is_debug = getattr(config.misc, "log_level", "") == "debug"
-    show_progress = config.misc.log_level == "default"
+    is_debug = LOGGER.lvlp(3)
+    show_progress = LOGGER.lvlp(2)
 
     def _recursive_mst_split(indices: List[int], sub_feats: np.ndarray) -> List[List[int]]:
         m = len(indices)
@@ -1384,9 +1373,7 @@ def refine_clusters_structure(clusters: List[List[int]], feats: np.ndarray, conf
                 is_garbage = True
 
             if is_garbage:
-                if is_debug:
-                    # В многопотоке логи могут перемешиваться, но для дебага сойдет
-                    LOGGER.debug(f"[refine-garbage] Rescue needed (avg_rad={avg_dist:.3f}).")
+                LOGGER.debug(f"[refine-garbage] Rescue needed (avg_rad={avg_dist:.3f}).")
                 
                 rescued_cores, hopeless_trash = _rescue_dense_cores(cleaned)
                 if rescued_cores:
@@ -1548,29 +1535,6 @@ def _cluster_neighbor_cost(
     return cost
 
 
-def _compute_cluster_cli(
-    items: List[int],
-    base_seq: List[int],
-    feats: np.ndarray,
-    use_centroid: bool,
-) -> Tuple[int, List[int], float, np.ndarray]:
-    base_len = len(base_seq)
-    centroid = _cluster_embedding(items, feats)
-    best_pos = 0
-    best_cost = float("inf")
-    best_orient = items
-    for pos in range(base_len + 1):
-        left = base_seq[pos - 1] if pos > 0 else None
-        right = base_seq[pos] if pos < base_len else None
-        for orient in (items, list(reversed(items))):
-            cost = _cluster_neighbor_cost(orient, left, right, feats, use_centroid, centroid)
-            if cost < best_cost:
-                best_cost = cost
-                best_pos = pos
-                best_orient = orient
-    return best_pos, best_orient, best_cost, centroid
-
-
 def _candidate_starts_for_cluster(desired: int, length: int, current_len: int, group_size: int) -> List[int]:
     """
     Generate candidate insertion indices based on group alignment rules.
@@ -1694,58 +1658,6 @@ def _placement_cost(
     return cost
 
 
-def _best_insertion_pos(seq: List[int], emb: np.ndarray, feats: np.ndarray) -> Tuple[int, float]:
-    best_cost = float("inf")
-    best_pos = 0
-    n = len(seq)
-    for pos in range(n + 1):
-        left_idx = seq[pos - 1] if pos > 0 else None
-        right_idx = seq[pos] if pos < n else None
-        cost = 0.0
-        if left_idx is not None:
-            cost += float(np.linalg.norm(feats[left_idx] - emb))
-        if right_idx is not None:
-            cost += float(np.linalg.norm(feats[right_idx] - emb))
-        if left_idx is not None and right_idx is not None:
-            cost -= float(np.linalg.norm(feats[left_idx] - feats[right_idx]))
-        if cost < best_cost:
-            best_cost = cost
-            best_pos = pos
-    return best_pos, best_cost
-
-
-def _orient_cluster_for_neighbors(order: List[int], feats: np.ndarray, left_idx: Optional[int], right_idx: Optional[int]) -> List[int]:
-    if len(order) <= 1:
-        return order
-    first, last = order[0], order[-1]
-    cost_forward = 0.0
-    cost_reverse = 0.0
-    if left_idx is not None:
-        cost_forward += float(np.linalg.norm(feats[left_idx] - feats[first]))
-        cost_reverse += float(np.linalg.norm(feats[left_idx] - feats[last]))
-    if right_idx is not None:
-        cost_forward += float(np.linalg.norm(feats[last] - feats[right_idx]))
-        cost_reverse += float(np.linalg.norm(feats[first] - feats[right_idx]))
-    return order if cost_forward <= cost_reverse else list(reversed(order))
-
-
-def _clamp_to_group(idx: int, length: int, group_size: int, total_len: int) -> int:
-    if group_size <= 0:
-        return max(0, min(idx, total_len))
-    group_start = (idx // group_size) * group_size
-    lower = group_start
-    upper = max(group_start, group_start + group_size - length)
-    if upper < lower:
-        upper = lower
-    clamped = idx
-    if clamped < lower:
-        clamped = lower
-    if clamped > upper:
-        clamped = upper
-    clamped = max(0, min(clamped, total_len))
-    return clamped
-
-
 def _build_sequence_names(
     sequence: List[int],
     feats: np.ndarray,
@@ -1835,20 +1747,6 @@ def _compute_cluster_cli_vectorized(
 
     # 2. Вычисляем стоимость вставки для всех позиций РАЗОМ
     # Позиций вставки n_base + 1 (от 0 до n_base)
-    #
-    # Cost[i] (вставка между i-1 и i) = 
-    #   Dist(Base[i-1], Cluster_Left) + 
-    #   Dist(Base[i], Cluster_Right) - 
-    #   Gap(Base[i-1], Base[i])
-    
-    # Подготовим массивы для "Left neighbor" и "Right neighbor"
-    # Для позиций в середине (от 1 до n_base-1):
-    # Left neighbors indices: 0..(n-2)
-    # Right neighbors indices: 1..(n-1)
-    
-    # --- Forward Orientation (items as is) ---
-    # Left connects to items[0] (c_start), Right connects to items[-1] (c_end)
-    
     # Стоимость для внутренних позиций (индексы вставки 1..n-1)
     # base_gap_dists[k] corresponds to gap between k and k+1
     mid_costs_fwd = (
@@ -1905,7 +1803,7 @@ def _export_cluster_sort(
         group_size = 10
     naming_mode = getattr(config.clustering, "naming_mode", "default")
     use_centroid = bool(getattr(config.clustering, "cluster_sort_use_centroid", True))
-    show_progress = True
+    show_progress = LOGGER.lvlp(2)
 
     # Map original cluster id for naming/contiguity
     cluster_id_map: Dict[int, int] = {}
@@ -1934,11 +1832,7 @@ def _export_cluster_sort(
     # 2. Internal sorting of discarded (base sequence)
     base_seq = _order_discarded(list(result.discarded), feats, config)
     feats_cache = feats.astype(np.float32, copy=False)
-    
-    # --- ОПТИМИЗАЦИЯ: Векторный расчет CLi ---
-    
-    # A. Пре-калькуляция данных базовой последовательности (делается 1 раз)
-    # Это переносит нагрузку с Python Loop на C++ NumPy
+
     base_vecs, base_gaps = _precompute_base_stats(base_seq, feats)
 
     # B. Расчет позиций для каждого кластера
@@ -1960,10 +1854,7 @@ def _export_cluster_sort(
         }
 
     job_args = [(pid, list(cl)) for pid, cl in enumerate(prepared)]
-    
-    # Запускаем многопоточность.
-    # Так как мы сняли блокировку GIL внутри math-операций, 
-    # потоки теперь будут реально нагружать CPU на 100%.
+
     cluster_count = len(job_args)
     max_workers = max(1, min(cluster_count, os.cpu_count() or 1))
 
@@ -2093,20 +1984,6 @@ def _prepare_group_filling_clusters(
         LOGGER.debug("[group_filling] no clusters after preparation (all discarded or empty input)")
 
     return prepared
-
-
-def _sort_clusters_by_embedding(clusters: List[List[int]], feats: np.ndarray, config: Config) -> List[List[int]]:
-    if not clusters:
-        return clusters
-    centroids = []
-    for cl in clusters:
-        if cl:
-            centroids.append(np.mean(feats[np.array(cl, dtype=int)].astype(np.float32, copy=False), axis=0))
-        else:
-            centroids.append(np.zeros((feats.shape[1],), dtype=np.float32))
-    centroids_arr = np.stack(centroids, axis=0).astype(np.float32, copy=False)
-    order = farthest_insertion_path(centroids_arr, config, show_progress=False)
-    return [clusters[int(i)] for i in order]
 
 
 def _split_cluster_by_fi(

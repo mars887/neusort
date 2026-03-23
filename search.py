@@ -5,11 +5,10 @@ from typing import Optional
 import faiss
 import numpy as np
 import torch
+import runtime_state as runtime
 from tqdm.auto import tqdm
 
-from database import load_features_from_db
 from faiss_io import load_faiss_index
-from cli import LOGGER, DEVICE
 from clip_manager import CLIP_PROCESSOR_MANAGER
 from features import extract_feature
 from models import load_model
@@ -56,11 +55,11 @@ def _match_existing_index(query_path: str, paths) -> Optional[int]:
 
 def _encode_clip_text_feature(model, text: str) -> Optional[np.ndarray]:
     if not text:
-        LOGGER.error("Текстовый запрос не задан.")
+        runtime.LOGGER.error("Текстовый запрос не задан.")
         return None
     text_processor = CLIP_PROCESSOR_MANAGER.text_processor
     if text_processor is None:
-        LOGGER.error("CLIP текстовый процессор не инициализирован. Загрузите CLIP модель.")
+        runtime.LOGGER.error("CLIP текстовый процессор не инициализирован. Загрузите CLIP модель.")
         return None
     clip_inner = getattr(model, "inner", model)
     try:
@@ -69,19 +68,19 @@ def _encode_clip_text_feature(model, text: str) -> Optional[np.ndarray]:
                 tokens = text_processor(text)
                 if isinstance(tokens, dict):
                     tokens = tokens.get("input_ids") or next(iter(tokens.values()))
-                tokens = tokens.to(DEVICE)
+                tokens = tokens.to(runtime.DEVICE)
                 feat = clip_inner.encode_text(tokens)
             elif hasattr(clip_inner, "get_text_features"):
                 inputs = text_processor(
                     text=[text], return_tensors="pt", padding=True, truncation=True
                 )
-                inputs = {k: v.to(DEVICE) for k, v in inputs.items()}
+                inputs = {k: v.to(runtime.DEVICE) for k, v in inputs.items()}
                 feat = clip_inner.get_text_features(**inputs)
             else:
-                LOGGER.error("Загруженная модель не поддерживает текстовые запросы.")
+                runtime.LOGGER.error("Загруженная модель не поддерживает текстовые запросы.")
                 return None
     except Exception as exc:
-        LOGGER.error(f"Не удалось получить CLIP текстовый эмбеддинг: {exc}")
+        runtime.LOGGER.error(f"Не удалось получить CLIP текстовый эмбеддинг: {exc}")
         return None
     vec = feat.detach().cpu().numpy().reshape(-1)
     return _normalize_vec(vec)
@@ -95,10 +94,10 @@ def _get_image_embedding(query_path: str, feats, paths, model, hook, config: Con
     try:
         feat = extract_feature(clean_path, model, hook, config)
     except Exception as exc:
-        LOGGER.error(f"Не удалось извлечь признаки для {query_path}: {exc}")
+        runtime.LOGGER.error(f"Не удалось извлечь признаки для {query_path}: {exc}")
         return None
     if feat is None:
-        LOGGER.error(f"Не удалось извлечь признаки для {query_path}.")
+        runtime.LOGGER.error(f"Не удалось извлечь признаки для {query_path}.")
         return None
     return _normalize_vec(feat.astype(np.float32, copy=False))
 
@@ -126,7 +125,7 @@ def _build_image_text_query(
     if fusion_mode == "directional":
         base_vec = base_text_vec
         if base_vec is None:
-            LOGGER.warning("Базовое текстовое описание не задано, используем текст запроса как базу.")
+            runtime.LOGGER.warning("Базовое текстовое описание не задано, используем текст запроса как базу.")
             base_vec = text_vec
         direction = text_vec - base_vec
         norm = np.linalg.norm(direction)
@@ -162,7 +161,7 @@ def compute_global_knn(feats: np.ndarray, k: int, config: Config, use_gpu: bool 
             res = faiss.StandardGpuResources()
             index = faiss.index_cpu_to_gpu(res, 0, index)
         except Exception as e:
-            LOGGER.info(f"  - Предупреждение: не удалось перенести FAISS на GPU: {e}. Будет использован CPU.")
+            runtime.LOGGER.info(f"  - Предупреждение: не удалось перенести FAISS на GPU: {e}. Будет использован CPU.")
     index.add(feats_f32)
 
     knn_k = min(k + 1, n)  # ищем k+1 чтобы исключить саму точку
@@ -223,20 +222,12 @@ def find_neighbors(
     """
     # Валидация
     if index is None or faiss_pos_to_path is None or order_map is None or feats is None or paths is None:
-        LOGGER.error("Ошибка: отсутствуют необходимые данные (index, faiss_pos_to_path, order_map, feats, paths).")
+        runtime.LOGGER.error("Ошибка: отсутствуют необходимые данные (index, faiss_pos_to_path, order_map, feats, paths).")
         return None
 
     # 1) Определяем, есть ли изображение в базе
-    orig_idx = None
-    if query_path in paths:
-        orig_idx = paths.index(query_path)
-    else:
-        base = os.path.basename(query_path)
-        matches = [i for i, p in enumerate(paths) if os.path.basename(p) == base]
-        if len(matches) == 1:
-            orig_idx = matches[0]
-        else:
-            orig_idx = None  # Внешнее изображение
+    normalized_query_path = _normalize_query_path(query_path)
+    orig_idx = _match_existing_index(normalized_query_path, paths)
 
     is_external = (orig_idx is None)
 
@@ -250,19 +241,19 @@ def find_neighbors(
             # Внешнее изображение - извлекаем признаки
             if model is None or hook is None:
                 if load_model_fn is None:
-                    LOGGER.error(f"{query_path}\t-1\tERROR_NO_MODEL_FUNC")
+                    runtime.LOGGER.error(f"{query_path}\t-1\tERROR_NO_MODEL_FUNC")
                     return None
                 try:
                     model, hook = load_model_fn(model_name)
                     model_loaded_here = True
                 except Exception as e:
-                    LOGGER.error(f"{query_path}\t-1\tERROR_LOAD_MODEL:{e}")
+                    runtime.LOGGER.error(f"{query_path}\t-1\tERROR_LOAD_MODEL:{e}")
                     return None
 
             try:
-                qfeat = extract_feature_fn(query_path, model, hook, config)
+                qfeat = extract_feature_fn(normalized_query_path, model, hook, config)
                 if qfeat is None:
-                    LOGGER.error(f"{query_path}\t-1\tERROR_EXTRACT")
+                    runtime.LOGGER.error(f"{query_path}\t-1\tERROR_EXTRACT")
                     if model_loaded_here:
                         try:
                             del model
@@ -273,7 +264,7 @@ def find_neighbors(
                     return None
                 qvec = qfeat.astype('float32').reshape(1, -1)
             except Exception as e:
-                LOGGER.error(f"{query_path}\t-1\tERROR_EXTRACT:{e}")
+                runtime.LOGGER.error(f"{query_path}\t-1\tERROR_EXTRACT:{e}")
                 if model_loaded_here:
                     try:
                         del model
@@ -311,11 +302,7 @@ def find_neighbors(
 
             neighbor_path = faiss_pos_to_path[faiss_pos]
             # Находим original index соседа, если он есть в базе
-            neighbor_orig_idx = -1
-            if not is_external:  # Только если запрос был внутренним, иначе маппинг может быть неполным
-                neighbor_orig_arr = np.where(order_map == faiss_pos)[0]
-                if neighbor_orig_arr.size > 0:
-                    neighbor_orig_idx = int(neighbor_orig_arr[0])
+            neighbor_orig_idx = int(order_map[faiss_pos])
 
             neighbors.append({
                 'faiss_index': faiss_pos,
@@ -397,13 +384,13 @@ def handle_search_pipeline(config: Config, feats, paths):
     fusion_mode = getattr(config.search, "fusion_mode", "simple").lower()
     requires_text = query_mode in {"text", "image+text"}
     if requires_text and not config.model.model_name.startswith("clip_"):
-        LOGGER.error("Текстовые запросы доступны только для CLIP-моделей. Укажите модель clip_* и пересчитайте признаки.")
+        runtime.LOGGER.error("Текстовые запросы доступны только для CLIP-моделей. Укажите модель clip_* и пересчитайте признаки.")
         return
 
     # --- Подготовка: Загрузка индекса и вспомогательных данных ---
     if not os.path.exists(config.files.index_file):
-        LOGGER.error(f"! Индекс не найден: {config.files.index_file}. Сначала запустите без --find, чтобы его построить.")
-        exit(2)
+        runtime.LOGGER.error(f"! Индекс не найден: {config.files.index_file}. Сначала запустите без --find, чтобы его построить.")
+        return
 
     index = load_faiss_index(config)
     
@@ -412,21 +399,27 @@ def handle_search_pipeline(config: Config, feats, paths):
     paths_txt_path = config.files.index_file + ".paths.txt"
     
     if not (os.path.exists(order_npy_path) and os.path.exists(paths_txt_path)):
-        LOGGER.error("! Для поиска требуются файлы .order.npy и .paths.txt. Перестройте индекс.")
-        exit(2)
+        runtime.LOGGER.error("! Для поиска требуются файлы .order.npy и .paths.txt. Перестройте индекс.")
+        return
 
     order_map = np.load(order_npy_path)  # faiss_pos -> original_idx
     with open(paths_txt_path, "r", encoding="utf-8") as f:
         faiss_pos_to_path = [line.strip() for line in f]
 
-    # Загрузим модель и hook один раз для всех запросов
     model, hook = None, None
-    if config.search.find == "__PIPE__" or config.search.find is not None:
+    def ensure_model_loaded() -> bool:
+        nonlocal model, hook
+        if model is not None and hook is not None:
+            return True
         try:
             model, hook = load_model(config.model.model_name)
+            return True
         except Exception as e:
-            LOGGER.error(f"! Не удалось загрузить модель для поиска: {e}")
-            exit(11)
+            runtime.LOGGER.error(f"! Не удалось загрузить модель для поиска: {e}")
+            return False
+
+    if requires_text and not ensure_model_loaded():
+        return
 
     base_text_vec = None
     if requires_text and fusion_mode == "directional":
@@ -434,7 +427,7 @@ def handle_search_pipeline(config: Config, feats, paths):
         if base_prompt:
             base_text_vec = _encode_clip_text_feature(model, base_prompt)
             if base_text_vec is None:
-                LOGGER.warning("Не удалось получить базовый текстовый эмбеддинг, будет использоваться текст запроса.")
+                runtime.LOGGER.warning("Не удалось получить базовый текстовый эмбеддинг, будет использоваться текст запроса.")
 
     # --- Вспомогательная функция для поиска и вывода ---
     def process_single_query(query_input: str, text_override: Optional[str] = None):
@@ -443,11 +436,13 @@ def handle_search_pipeline(config: Config, feats, paths):
         query_label = query_input
 
         if query_mode == "text":
+            if not ensure_model_loaded():
+                return
             actual_text = text_override
             if actual_text is None or actual_text == "":
                 actual_text = config.search.query_text or query_input
             if not actual_text:
-                LOGGER.error("Для текстового поиска нужно задать --query_text или строку в качестве значения --find.")
+                runtime.LOGGER.error("Для текстового поиска нужно задать --query_text или строку в качестве значения --find.")
                 return
             text_vec = _encode_clip_text_feature(model, actual_text)
             if text_vec is None:
@@ -455,12 +450,14 @@ def handle_search_pipeline(config: Config, feats, paths):
             qvec = text_vec.reshape(1, -1)
             query_label = f"[text] {actual_text}"
         elif query_mode == "image+text":
+            if not ensure_model_loaded():
+                return
             if not query_input:
-                LOGGER.error("Для режима image+text необходимо указать путь к изображению.")
+                runtime.LOGGER.error("Для режима image+text необходимо указать путь к изображению.")
                 return
             actual_text = text_override if text_override not in (None, "") else config.search.query_text
             if not actual_text:
-                LOGGER.error("Для режима image+text добавьте описание через --query_text или передавайте его через pipeline.")
+                runtime.LOGGER.error("Для режима image+text добавьте описание через --query_text или передавайте его через pipeline.")
                 return
             image_path = _normalize_query_path(query_input)
             query_vec = _build_image_text_query(
@@ -484,6 +481,8 @@ def handle_search_pipeline(config: Config, feats, paths):
         else:
             # image-only mode: normalize possible quoted / mixed-separator path
             query_label = _normalize_query_path(query_input)
+            if _match_existing_index(query_label, paths) is None and not ensure_model_loaded():
+                return
 
         result = find_neighbors(
             index=index,
@@ -504,7 +503,7 @@ def handle_search_pipeline(config: Config, feats, paths):
         )
 
         if result is None:
-            LOGGER.error(f"Не удалось найти соседей для: {query_label}")
+            runtime.LOGGER.error(f"Не удалось найти соседей для: {query_label}")
             return
 
         # Форматируем и выводим результат в соответствии с настройкой
@@ -515,11 +514,11 @@ def handle_search_pipeline(config: Config, feats, paths):
     # --- Режим pipeline: чтение путей из stdin ---
     if config.search.find == "__PIPE__":
         if query_mode == "text":
-            LOGGER.info("Pipeline text mode: вводите по одному текстовому запросу на строку (Ctrl+D/Ctrl+C для выхода).")
+            runtime.LOGGER.info("Pipeline text mode: вводите по одному текстовому запросу на строку (Ctrl+D/Ctrl+C для выхода).")
         elif query_mode == "image+text":
-            LOGGER.info("Pipeline image+text: каждая строка должна быть 'путь\tописание'.")
+            runtime.LOGGER.info("Pipeline image+text: каждая строка должна быть 'путь\tописание'.")
         else:
-            LOGGER.info("Pipeline mode started. Enter image paths (Ctrl+D/Ctrl+C to stop):")
+            runtime.LOGGER.info("Pipeline mode started. Enter image paths (Ctrl+D/Ctrl+C to stop):")
         for raw_line in sys.stdin:
             line = raw_line.rstrip("\n")
             if not line.strip():
@@ -528,7 +527,7 @@ def handle_search_pipeline(config: Config, feats, paths):
                 process_single_query(line, text_override=line)
             elif query_mode == "image+text":
                 if "\t" not in line:
-                    LOGGER.error("Неверный формат строки. Используйте 'путь\tописание'.")
+                    runtime.LOGGER.error("Неверный формат строки. Используйте 'путь\tописание'.")
                     continue
                 path_part, text_part = line.split("\t", 1)
                 process_single_query(path_part.strip(), text_override=text_part.strip())
@@ -546,4 +545,4 @@ def handle_search_pipeline(config: Config, feats, paths):
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
         except Exception as e:
-            LOGGER.error(f"Ошибка при освобождении памяти модели: {e}")
+            runtime.LOGGER.error(f"Ошибка при освобождении памяти модели: {e}")

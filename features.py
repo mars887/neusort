@@ -4,12 +4,12 @@
 # Стандартный препроцессор для быстрого режима
 import numpy as np
 import torch
+import runtime_state as runtime
 from torchvision import transforms
 from torchvision.transforms import InterpolationMode
 
 from PIL import Image
 
-from cli import DEVICE, LOGGER
 from config import Config
 from models import MODEL_CONFIGS
 Image.MAX_IMAGE_PIXELS = None  # Снимает ограничение на размер изображений
@@ -38,7 +38,7 @@ def extract_feature(path, model, hook_blob, config: Config):
         pix_dim = MODEL_CONFIGS.get(config.model.model_name, {}).get("input_size", 336)
         clip_processor = CLIP_PROCESSOR_MANAGER.processor
         if clip_processor is None:
-            LOGGER.error("CLIP_PROCESSOR не инициализирован, CLIP-модель не готова к использованию")
+            runtime.LOGGER.error("CLIP_PROCESSOR не инициализирован, CLIP-модель не готова к использованию")
     else:
         # Prefer config value; else derive from known families; default to 448
         pix_dim = MODEL_CONFIGS.get(config.model.model_name, {}).get(
@@ -62,7 +62,7 @@ def extract_feature(path, model, hook_blob, config: Config):
         tls = hook_blob.get("tls")
         t = getattr(tls, "feat", None) if tls is not None else hook_blob.get("feat")
         if t is None:
-            raise RuntimeError("hook_blob �� ���������� � hook �� ��������")
+            raise RuntimeError("hook_blob не был заполнен: hook не сохранил признаки")
         # ������ hook ��������� shape (1, D) ���� (D,), �������� � 1D numpy float32
         if isinstance(t, torch.Tensor):
             arr = t.detach().cpu().numpy().reshape(-1).astype(np.float32)
@@ -80,7 +80,7 @@ def extract_feature(path, model, hook_blob, config: Config):
             # Используем CLIPProcessor если доступен — он сделает корректную нормализацию и ресайз
             if clip_processor is not None:
                 inputs = clip_processor(images=img, return_tensors="pt")  # uses model's expected size
-                pixel_values = inputs["pixel_values"].to(DEVICE)
+                pixel_values = inputs["pixel_values"].to(runtime.DEVICE)
                 reset_hook_storage()
                 with torch.no_grad():
                     _ = model(pixel_values)
@@ -94,7 +94,7 @@ def extract_feature(path, model, hook_blob, config: Config):
                     transforms.Normalize(mean=[0.48145466, 0.4578275, 0.40821073],
                                          std=[0.26862954, 0.26130258, 0.27577711]),
                 ])
-                x = preproc(img).unsqueeze(0).to(DEVICE)
+                x = preproc(img).unsqueeze(0).to(runtime.DEVICE)
                 reset_hook_storage()
                 with torch.no_grad():
                     _ = model(x)
@@ -117,7 +117,7 @@ def extract_feature(path, model, hook_blob, config: Config):
                     transforms.Normalize(mean=[0.485, 0.456, 0.406],
                                          std=[0.229, 0.224, 0.225]),
                 ])
-            x = preproc(img).unsqueeze(0).to(DEVICE)
+            x = preproc(img).unsqueeze(0).to(runtime.DEVICE)
             with torch.no_grad():
                 _ = model(x)
             feat = fetch_feat_from_hook()
@@ -167,7 +167,7 @@ def extract_feature(path, model, hook_blob, config: Config):
         """Принимает PIL Image (кроп)"""
         if is_clip and clip_processor is not None:
             inputs = clip_processor(images=pil_img_crop, return_tensors="pt")
-            pixel_values = inputs["pixel_values"].to(DEVICE)
+            pixel_values = inputs["pixel_values"].to(runtime.DEVICE)
             reset_hook_storage()
             with torch.no_grad():
                 _ = model(pixel_values)
@@ -175,7 +175,7 @@ def extract_feature(path, model, hook_blob, config: Config):
         else:
             if resize_after_crop is not None:
                 pil_img_crop = resize_after_crop(pil_img_crop)
-            x = final_transform(pil_img_crop).unsqueeze(0).to(DEVICE)
+            x = final_transform(pil_img_crop).unsqueeze(0).to(runtime.DEVICE)
             reset_hook_storage()
             with torch.no_grad():
                 _ = model(x)

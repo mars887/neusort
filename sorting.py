@@ -14,7 +14,7 @@ from scipy.sparse.csgraph import minimum_spanning_tree, connected_components
 
 from config import Config
 from faiss_io import save_faiss_index
-from cli import LOGGER
+from runtime_state import LOGGER
 from metrics import evaluate_order_metrics
 from search import compute_global_knn
 from utils import copy_and_rename, to_local_order
@@ -1226,9 +1226,22 @@ def sort_by_ann_mst(feats: np.ndarray, k: int, config: Config):
                 LOGGER.error(f"    - INTEGRITY: значения вне [0,{M-1}] (min={order_local.min()}, max={order_local.max()}); clip.")
                 order_local = np.clip(order_local, 0, M-1)
 
-            # --- метрики считаем ЛОКАЛЬНО ---
-            metrics = evaluate_order_metrics(order=order_local, X=X_main, labels=None)
-            print(metrics)
+            # --- тяжёлые метрики считаем только в debug ---
+            if LOGGER.lvlp(3):
+                metrics = evaluate_order_metrics(order=order_local, X=X_main, labels=None)
+                metric_preview_keys = (
+                    "path_length",
+                    "path_length_normalized",
+                    "edge_mean",
+                    "edge_p90",
+                    "spearman_pair_corr",
+                )
+                metric_preview = {
+                    key: metrics[key]
+                    for key in metric_preview_keys
+                    if key in metrics
+                }
+                LOGGER.debug(f"main-component metrics: {metric_preview}")
 
             # --- глобальный путь для последующих шагов ---
             main_path = main_nodes_indices[order_local]

@@ -2,8 +2,8 @@ import os
 import shutil
 
 import numpy as np
+import runtime_state as runtime
 from tqdm.auto import tqdm
-from cli import CONFIG, LOGGER
 from config import Config
 
 
@@ -33,7 +33,7 @@ def copy_and_rename(paths, order, out_folder,config: Config):
     if pbar is not None:
         pbar.close()
 
-    LOGGER.info(f"Копирование завершено.")
+    runtime.LOGGER.info("Копирование завершено.")
 
 def output_sequence_with_neighbors(paths, feats, order, neighbors, out_file=None):
     """
@@ -50,7 +50,7 @@ def output_sequence_with_neighbors(paths, feats, order, neighbors, out_file=None
 
     n = len(order)
     if n == 0:
-        LOGGER.info("Нет элементов для вывода.")
+        runtime.LOGGER.info("Нет элементов для вывода.")
         return
 
     # Ordered arrays according to the final path
@@ -89,9 +89,9 @@ def output_sequence_with_neighbors(paths, feats, order, neighbors, out_file=None
         # Сохраняем в файл с utf-8
         with open(out_file, "w", encoding="utf-8") as f:
             f.write(output_text)
-        LOGGER.info(f"Saved neighbor list to: {out_file}")
+        runtime.LOGGER.info(f"Saved neighbor list to: {out_file}")
     else:
-        LOGGER.info(output_text)
+        runtime.LOGGER.info(output_text)
 
 
 def to_local_order(order_global: np.ndarray, component_nodes: np.ndarray, total_n: int) -> np.ndarray:

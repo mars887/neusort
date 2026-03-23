@@ -20,7 +20,7 @@ except Exception:  # pragma: no cover
 import numpy as np
 from tqdm.auto import tqdm
 
-from cli import LOGGER
+from runtime_state import LOGGER
 from config import Config
 from utils import copy_and_rename
 from sorting import farthest_insertion_path, farthest_insertion_path_clustered

@@ -10,6 +10,7 @@ from config import Config
 from logger import CustomLogger, LogLevel
 from models import MODEL_CONFIGS, set_model_logger
 from model_factory import set_model_factory_runtime
+import runtime_state as runtime
 
 
 DEFAULT_FEATURE_WORKERS = max(1, os.cpu_count() or 1)
@@ -277,7 +278,7 @@ CLI_SPEC: List[Dict[str, Any]] = [
         "names": ["--more_scan"],
         "action": "store_true",
         "default": False,
-        "help": "Rescan folders recursively to discover additional files before processing.",
+        "help": "Use multi-crop feature extraction instead of a single center crop.",
         "tags": ["Param"],
     },
     {
@@ -668,6 +669,7 @@ ENTERED_PARAMS = _collect_entered_params(raw_cli_args)
 LOGGER = CustomLogger(level=LogLevel(getattr(args, "loglevel", None) or "default"))
 set_model_logger(LOGGER)
 set_model_factory_runtime(logger=LOGGER)
+runtime.set_runtime(logger=LOGGER)
 # Merge grouped defaults declared in CLI_SPEC with user-provided overrides
 EFFECTIVE_GROUPED: Dict[str, Any] = dict(DEFAULT_GROUPED_VALUES)
 EFFECTIVE_GROUPED.update(ENTERED_GROUPED)
@@ -682,6 +684,7 @@ if CONFIG.model.use_cpu:
 else:
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 set_model_factory_runtime(device=DEVICE)
+runtime.set_runtime(device=DEVICE)
     
 """
 Neusort CLI — Developer Guide

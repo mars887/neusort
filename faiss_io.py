@@ -2,7 +2,9 @@
 import os
 import faiss
 
-from cli import LOGGER, Config
+import runtime_state as runtime
+
+from config import Config
 
 
 def save_faiss_index(index, index_path,config: Config):
@@ -24,7 +26,7 @@ def save_faiss_index(index, index_path,config: Config):
         faiss.write_index(index_cpu, tmp_path)
         os.replace(tmp_path, index_path)
     except Exception as e:
-        LOGGER.error(f"! Не удалось сохранить FAISS индекс: {e}")
+        runtime.LOGGER.error(f"! Не удалось сохранить FAISS индекс: {e}")
         if os.path.exists(tmp_path):
             try: os.remove(tmp_path)
             except: pass
@@ -37,12 +39,12 @@ def load_faiss_index(config: Config):
     if not os.path.exists(index_path):
         raise FileNotFoundError(index_path)
     index = faiss.read_index(index_path)
-    if config.model.use_cpu:
+    if not config.model.use_cpu:
         try:
             if faiss.get_num_gpus() > 0:
                 res = faiss.StandardGpuResources()
                 index = faiss.index_cpu_to_gpu(res, config.model.gpu_id, index)
         except Exception as e:
-            LOGGER.info(f"  - Предупреждение: не удалось перенести индекс на GPU: {e}")
+            runtime.LOGGER.info(f"  - Предупреждение: не удалось перенести индекс на GPU: {e}")
     return index
 

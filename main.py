@@ -6,7 +6,7 @@ os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 os.environ.setdefault("MKL_NUM_THREADS", "1")
 os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 
-from cli import CONFIG, LOGGER, TASK_PLAN, HEAVY_TASKS
+from cli import CONFIG, LOGGER, TASK_PLAN, HEAVY_TASKS, ENTERED_GROUPED
 from core import run_sorting_pipeline, run_search_pipeline, run_clustering_pipeline
 from database import list_database_files, move_database_entries, process_and_cache_features
 
@@ -28,7 +28,6 @@ if __name__ == "__main__":
     if any(t in HEAVY_TASKS for t in TASK_PLAN):
         if not os.path.isdir(CONFIG.files.src_folder):
             LOGGER.error(f"Source folder {CONFIG.files.src_folder} not found.")
-            os.makedirs(CONFIG.files.src_folder, exist_ok=True)
             sys.exit(1)
 
     if CONFIG.misc.index_only:
@@ -58,7 +57,7 @@ if __name__ == "__main__":
             continue
 
         if t == "--find" and CONFIG.search.find:
-            run_search_pipeline(CONFIG, DB_FILE, INDEX_FILE)
+            run_search_pipeline(CONFIG, DB_FILE, INDEX_FILE, ENTERED_GROUPED)
             continue
 
         if t == "--sorting":

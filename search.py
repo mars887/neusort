@@ -1,5 +1,6 @@
 import os
 import sys
+from dataclasses import dataclass
 from typing import Optional
 
 import faiss
@@ -13,6 +14,17 @@ from clip_manager import CLIP_PROCESSOR_MANAGER
 from features import extract_feature
 from models import load_model
 from config import Config
+
+
+IMAGE_FILE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".jfif"}
+
+
+@dataclass
+class ParsedFindQuery:
+    raw_input: str
+    auto_mode: str
+    image_path: Optional[str] = None
+    inline_text: Optional[str] = None
 
 
 def _normalize_vec(vec: np.ndarray) -> np.ndarray:
@@ -38,6 +50,93 @@ def _normalize_query_path(path: str) -> str:
     except Exception:
         pass
     return p
+
+
+def _is_existing_image_path(path: str) -> bool:
+    normalized = _normalize_query_path(path)
+    if not normalized or not os.path.isfile(normalized):
+        return False
+    _, ext = os.path.splitext(normalized)
+    return ext.lower() in IMAGE_FILE_EXTENSIONS
+
+
+def _resolve_existing_image_path(path: str) -> Optional[str]:
+    normalized = _normalize_query_path(path)
+    if _is_existing_image_path(normalized):
+        return normalized
+    return None
+
+
+def _looks_like_image_path_hint(path: str) -> bool:
+    normalized = _normalize_query_path(path)
+    if not normalized:
+        return False
+    if os.path.isabs(normalized):
+        return True
+    if any(sep in path for sep in (os.sep, "/", "\\")):
+        return True
+    _, ext = os.path.splitext(normalized)
+    return ext.lower() in IMAGE_FILE_EXTENSIONS
+
+
+def _split_query_segments(raw: str):
+    if "|" in raw:
+        return [part.strip() for part in raw.split("|")], " | "
+    if "\t" in raw:
+        return [part.strip() for part in raw.split("\t")], " "
+    return None, None
+
+
+def _split_image_text_query(raw: str, allow_path_hint: bool = False):
+    segments, joiner = _split_query_segments(raw)
+    if not segments or len(segments) < 2:
+        return None, None
+
+    image_matches = []
+    for idx, segment in enumerate(segments):
+        image_path = _resolve_existing_image_path(segment)
+        if image_path:
+            image_matches.append((idx, image_path))
+
+    if len(image_matches) == 1:
+        image_idx, image_path = image_matches[0]
+        text = joiner.join(part for idx, part in enumerate(segments) if idx != image_idx and part)
+        return image_path, text or None
+
+    if allow_path_hint:
+        hinted_paths = []
+        for idx, segment in enumerate(segments):
+            if _looks_like_image_path_hint(segment):
+                hinted_paths.append((idx, _normalize_query_path(segment)))
+        if len(hinted_paths) == 1:
+            image_idx, image_path = hinted_paths[0]
+            text = joiner.join(part for idx, part in enumerate(segments) if idx != image_idx and part)
+            return image_path, text or None
+
+    return None, None
+
+
+def parse_find_query_input(query_input: str) -> ParsedFindQuery:
+    raw = (str(query_input or "")).strip()
+    image_path = _resolve_existing_image_path(raw)
+    if image_path:
+        return ParsedFindQuery(raw_input=raw, auto_mode="image", image_path=image_path)
+
+    image_path, inline_text = _split_image_text_query(raw, allow_path_hint=False)
+    if image_path:
+        auto_mode = "image+text" if inline_text else "image"
+        return ParsedFindQuery(
+            raw_input=raw,
+            auto_mode=auto_mode,
+            image_path=image_path,
+            inline_text=inline_text,
+        )
+
+    return ParsedFindQuery(
+        raw_input=raw,
+        auto_mode="text",
+        inline_text=raw or None,
+    )
 
 
 def _match_existing_index(query_path: str, paths) -> Optional[int]:
@@ -381,12 +480,8 @@ def format_neighbors_output(result, output_format='both'):
 def handle_search_pipeline(config: Config, feats, paths):
     use_gpu_faiss = (not config.model.use_cpu) and torch.cuda.is_available()
     query_mode = getattr(config.search, "query_mode", "image").lower()
+    query_mode_explicit = bool(getattr(config.search, "_query_mode_explicit", False))
     fusion_mode = getattr(config.search, "fusion_mode", "simple").lower()
-    requires_text = query_mode in {"text", "image+text"}
-    if requires_text and not config.model.model_name.startswith("clip_"):
-        runtime.LOGGER.error("Текстовые запросы доступны только для CLIP-моделей. Укажите модель clip_* и пересчитайте признаки.")
-        return
-
     # --- Подготовка: Загрузка индекса и вспомогательных данных ---
     if not os.path.exists(config.files.index_file):
         runtime.LOGGER.error(f"! Индекс не найден: {config.files.index_file}. Сначала запустите без --find, чтобы его построить.")
@@ -418,48 +513,75 @@ def handle_search_pipeline(config: Config, feats, paths):
             runtime.LOGGER.error(f"! Не удалось загрузить модель для поиска: {e}")
             return False
 
-    if requires_text and not ensure_model_loaded():
-        return
+    def ensure_text_search_ready() -> bool:
+        if not config.model.model_name.startswith("clip_"):
+            runtime.LOGGER.error("Текстовые запросы доступны только для CLIP-моделей. Укажите модель clip_* и пересчитайте признаки.")
+            return False
+        return ensure_model_loaded()
 
     base_text_vec = None
-    if requires_text and fusion_mode == "directional":
-        base_prompt = (getattr(config.search, "base_prompt", "") or "").strip()
-        if base_prompt:
-            base_text_vec = _encode_clip_text_feature(model, base_prompt)
-            if base_text_vec is None:
-                runtime.LOGGER.warning("Не удалось получить базовый текстовый эмбеддинг, будет использоваться текст запроса.")
+    base_text_vec_ready = False
 
     # --- Вспомогательная функция для поиска и вывода ---
-    def process_single_query(query_input: str, text_override: Optional[str] = None):
-        """Обрабатывает один запрос поиска и выводит результат."""
-        qvec = None
-        query_label = query_input
+    def get_base_text_vec() -> Optional[np.ndarray]:
+        nonlocal base_text_vec, base_text_vec_ready
+        if base_text_vec_ready:
+            return base_text_vec
+        base_text_vec_ready = True
+        if fusion_mode != "directional":
+            return None
+        base_prompt = (getattr(config.search, "base_prompt", "") or "").strip()
+        if not base_prompt:
+            return None
+        if not ensure_text_search_ready():
+            return None
+        base_text_vec = _encode_clip_text_feature(model, base_prompt)
+        if base_text_vec is None:
+            runtime.LOGGER.warning("РќРµ СѓРґР°Р»РѕСЃСЊ РїРѕР»СѓС‡РёС‚СЊ Р±Р°Р·РѕРІС‹Р№ С‚РµРєСЃС‚РѕРІС‹Р№ СЌРјР±РµРґРґРёРЅРі, Р±СѓРґРµС‚ РёСЃРїРѕР»СЊР·РѕРІР°С‚СЊСЃСЏ С‚РµРєСЃС‚ Р·Р°РїСЂРѕСЃР°.")
+        return base_text_vec
 
-        if query_mode == "text":
-            if not ensure_model_loaded():
+    def process_single_query(query_input: str):
+        """Обрабатывает один запрос поиска и выводит результат."""
+        parsed_query = parse_find_query_input(query_input)
+        effective_mode = query_mode if query_mode_explicit else parsed_query.auto_mode
+        qvec = None
+        query_label = parsed_query.raw_input or str(query_input or "").strip()
+
+        if effective_mode == "text":
+            if not ensure_text_search_ready():
                 return
-            actual_text = text_override
-            if actual_text is None or actual_text == "":
-                actual_text = config.search.query_text or query_input
+            actual_text = parsed_query.raw_input or str(query_input or "").strip()
             if not actual_text:
-                runtime.LOGGER.error("Для текстового поиска нужно задать --query_text или строку в качестве значения --find.")
+                runtime.LOGGER.error("Для текстового поиска нужна непустая строка в --find или stdin.")
                 return
             text_vec = _encode_clip_text_feature(model, actual_text)
             if text_vec is None:
                 return
             qvec = text_vec.reshape(1, -1)
             query_label = f"[text] {actual_text}"
-        elif query_mode == "image+text":
-            if not ensure_model_loaded():
+        elif effective_mode == "image+text":
+            if not ensure_text_search_ready():
                 return
-            if not query_input:
-                runtime.LOGGER.error("Для режима image+text необходимо указать путь к изображению.")
+            image_path = parsed_query.image_path
+            actual_text = parsed_query.inline_text
+            if "|" in parsed_query.raw_input or "\t" in parsed_query.raw_input:
+                hinted_path, hinted_text = _split_image_text_query(
+                    parsed_query.raw_input,
+                    allow_path_hint=query_mode_explicit,
+                )
+                if image_path is None and hinted_path:
+                    image_path = hinted_path
+                if not actual_text and hinted_text:
+                    actual_text = hinted_text
+            if image_path is None and query_mode_explicit:
+                image_path = _normalize_query_path(query_input)
+            if not image_path:
+                runtime.LOGGER.error("Для режима image+text нужна строка вида 'text | path/to/image'.")
                 return
-            actual_text = text_override if text_override not in (None, "") else config.search.query_text
             if not actual_text:
-                runtime.LOGGER.error("Для режима image+text добавьте описание через --query_text или передавайте его через pipeline.")
+                runtime.LOGGER.error("Для режима image+text нужно указать и текст, и путь к изображению.")
                 return
-            image_path = _normalize_query_path(query_input)
+            image_path = image_path or _normalize_query_path(query_input)
             query_vec = _build_image_text_query(
                 image_path,
                 actual_text,
@@ -472,7 +594,7 @@ def handle_search_pipeline(config: Config, feats, paths):
                 getattr(config.search, "image_weight", 0.5),
                 getattr(config.search, "text_weight", 0.5),
                 getattr(config.search, "directional_alpha", 0.7),
-                base_text_vec,
+                get_base_text_vec(),
             )
             if query_vec is None:
                 return
@@ -480,7 +602,7 @@ def handle_search_pipeline(config: Config, feats, paths):
             query_label = image_path
         else:
             # image-only mode: normalize possible quoted / mixed-separator path
-            query_label = _normalize_query_path(query_input)
+            query_label = parsed_query.image_path or _normalize_query_path(query_input)
             if _match_existing_index(query_label, paths) is None and not ensure_model_loaded():
                 return
 
@@ -513,26 +635,19 @@ def handle_search_pipeline(config: Config, feats, paths):
 
     # --- Режим pipeline: чтение путей из stdin ---
     if config.search.find == "__PIPE__":
-        if query_mode == "text":
+        if not query_mode_explicit:
+            runtime.LOGGER.info("Pipeline auto mode: путь к существующему изображению -> image, обычная строка -> text, 'text | path/to/image' -> image+text.")
+        elif query_mode == "text":
             runtime.LOGGER.info("Pipeline text mode: вводите по одному текстовому запросу на строку (Ctrl+D/Ctrl+C для выхода).")
         elif query_mode == "image+text":
-            runtime.LOGGER.info("Pipeline image+text: каждая строка должна быть 'путь\tописание'.")
+            runtime.LOGGER.info("Pipeline image+text: каждая строка должна быть 'text | path/to/image'.")
         else:
-            runtime.LOGGER.info("Pipeline mode started. Enter image paths (Ctrl+D/Ctrl+C to stop):")
+            runtime.LOGGER.info("Pipeline mode started. Вводите пути к изображениям (Ctrl+D/Ctrl+C для выхода).")
         for raw_line in sys.stdin:
-            line = raw_line.rstrip("\n")
+            line = raw_line.rstrip("\r\n")
             if not line.strip():
                 continue
-            if query_mode == "text":
-                process_single_query(line, text_override=line)
-            elif query_mode == "image+text":
-                if "\t" not in line:
-                    runtime.LOGGER.error("Неверный формат строки. Используйте 'путь\tописание'.")
-                    continue
-                path_part, text_part = line.split("\t", 1)
-                process_single_query(path_part.strip(), text_override=text_part.strip())
-            else:
-                process_single_query(line.strip())
+            process_single_query(line.strip())
     # --- Режим одиночного запроса ---
     else:
         target_path = config.search.find

@@ -375,13 +375,6 @@ CLI_SPEC: List[Dict[str, Any]] = [
         "help": "Skip file system writes and only print the operations that would run.",
         "tags": ["Param"],
     },
-    {
-        "names": ["--query_text"],
-        "type": str,
-        "metavar": "TEXT",
-        "help": "Inline text used by --find text/image+text modes.",
-        "tags": ["Param"],
-    },
 ]
 
 

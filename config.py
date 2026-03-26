@@ -238,7 +238,6 @@ class SearchConfig:
     text_weight: float
     directional_alpha: float
     base_prompt: str
-    query_text: Optional[str]
 
     @classmethod
     def from_args(cls, args: Any, grouped: dict[str, Any]) -> "SearchConfig":
@@ -268,11 +267,10 @@ class SearchConfig:
             backend=backend,
             query_mode=query_mode,
             fusion_mode=fusion_mode,
-            image_weight=_group_float(grouped, 'find', 'image_weight', 0.5),
-            text_weight=_group_float(grouped, 'find', 'text_weight', 0.5),
+            image_weight=_group_float(grouped, 'find', 'image_weight', 0.3),
+            text_weight=_group_float(grouped, 'find', 'text_weight', 0.7),
             directional_alpha=_group_float(grouped, 'find', 'directional_alpha', 0.7),
             base_prompt=_group_str(grouped, 'find', 'base_prompt', 'a photo on a road'),
-            query_text=getattr(args, 'query_text', None),
         )
 
 

@@ -124,6 +124,7 @@ python main.py --index_only -i input_images
 - если `query_mode` не задан явно, код пытается определить его автоматически:
   - путь к существующему файлу -> `image` или `image+text`;
   - строка, не являющаяся файлом -> `text`;
+  - строка вида `text | path/to/image` -> `image+text`;
 - `--find` считается финальной задачей и всегда выполняется последней.
 
 ## Принцип работы CLI
@@ -168,7 +169,6 @@ python main.py --find path\\to\\query.jpg find_neighbors=20:find_result_type=bot
 | `--move_db OLD_ROOT NEW_ROOT` | - | Переместить файлы и переписать пути в БД |
 | `--print_params all|entered` | - | Показать эффективные или только введённые параметры |
 | `--list_only` | `false` | Не копировать файлы; для сортировки формировать TSV, для кластеризации печатать/сводить без фактического экспорта |
-| `--query_text TEXT` | - | Текст для `--find` в режимах `text` и `image+text` |
 | `--index_only` | `false` | Только вычислить/обновить кэш признаков и выйти |
 
 ## Подпараметры `--sorting`
@@ -226,7 +226,7 @@ python main.py --cluster algorithm=distance:threshold=0.35:cluster_min_size=2
 ```powershell
 python main.py --find path\\to\\query.jpg find_neighbors=10:find_result_type=both
 python main.py --find "night city street" query_mode=text -m clip_vit_liaon
-python main.py --find path\\to\\query.jpg query_mode=image+text:fusion_mode=directional --query_text "rainy night"
+python main.py --find "rainy night | path\\to\\query.jpg" query_mode=image+text:fusion_mode=directional
 ```
 
 | Подпараметр | По умолчанию | Назначение |
@@ -248,12 +248,13 @@ python main.py --find path\\to\\query.jpg query_mode=image+text:fusion_mode=dire
 ```powershell
 Get-Content queries.txt | python main.py --find
 Get-Content text_queries.txt | python main.py --find __PIPE__ query_mode=text -m clip_vit_liaon
+Get-Content mixed_queries.txt | python main.py --find __PIPE__
 ```
 
 Для `image+text` каждая строка stdin должна иметь формат:
 
 ```text
-путь_к_файлу<TAB>текстовый_запрос
+текстовый_запрос | путь_к_файлу
 ```
 
 ## Поддерживаемые модели

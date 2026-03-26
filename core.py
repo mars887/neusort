@@ -1,11 +1,10 @@
 # core.py
 
-import os
 import torch
 import runtime_state as runtime
 from database import process_and_cache_features, load_features_from_db
 from sorting import sort_images
-from search import handle_search_pipeline
+from search import handle_search_pipeline, parse_find_query_input
 from clustering import (
     cluster_by_distance,
     cluster_by_hdbscan,
@@ -22,22 +21,6 @@ from clustering import (
     apply_pca_whitening,
     export_clusters,
 )
-
-
-IMAGE_FILE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".jfif"}
-
-
-def _looks_like_image_path(raw: str) -> bool:
-    if not raw:
-        return False
-    normalized = os.path.normpath(raw)
-    if os.path.isabs(normalized):
-        return True
-    if any(sep in raw for sep in (os.sep, "/", "\\")):
-        return True
-    _, ext = os.path.splitext(normalized)
-    return ext.lower() in IMAGE_FILE_EXTENSIONS
-
 
 def run_sorting_pipeline(config, db_file, index_file):
     """
@@ -59,28 +42,17 @@ def run_search_pipeline(config, db_file, index_file, entered_grouped=None):
     """
     Pipeline for the --find mode.
     """
-    # Auto-detect query_mode based on what was passed to --find / --query_text
     search_cfg = getattr(config, "search", None)
     entered_grouped = entered_grouped or {}
     if search_cfg is not None:
+        query_mode_explicit = "find.query_mode" in entered_grouped
+        setattr(search_cfg, "_query_mode_explicit", query_mode_explicit)
         find_arg = getattr(search_cfg, "find", None)
-        # Skip pipeline mode and respect explicit query_mode from CLI subparams
-        if find_arg and find_arg != "__PIPE__" and "find.query_mode" not in entered_grouped:
-            raw = str(find_arg).strip()
-            # Strip surrounding quotes if the user passed a quoted path literally
-            if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in ("'", '"'):
-                raw = raw[1:-1].strip()
-            normalized = os.path.normpath(raw) if raw else raw
-            has_text = bool(getattr(search_cfg, "query_text", None))
-            is_file = bool(normalized) and os.path.isfile(normalized)
-            if is_file:
-                # Normalize stored path so downstream code works even if slashes/quotes differ
-                search_cfg.find = normalized
-                inferred_mode = "image+text" if has_text else "image"
-            elif _looks_like_image_path(raw):
-                inferred_mode = "image+text" if has_text else "image"
-            else:
-                inferred_mode = "text"
+        if find_arg and find_arg != "__PIPE__" and not query_mode_explicit:
+            parsed_query = parse_find_query_input(find_arg)
+            inferred_mode = parsed_query.auto_mode
+            if parsed_query.image_path and parsed_query.auto_mode == "image":
+                search_cfg.find = parsed_query.image_path
             prev_mode = (getattr(search_cfg, "query_mode", "") or "").lower()
             if prev_mode != inferred_mode:
                 runtime.LOGGER.info(f"Auto-detected query_mode='{inferred_mode}' for --find input.")

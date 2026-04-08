@@ -359,3 +359,6 @@ python main.py --find path\\to\\query.jpg find_neighbors=20:find_result_type=bot
 ```powershell
 python main.py --find "red car at sunset" query_mode=text -m clip_vit_liaon
 ```
+
+## 
+### За основу был взят скрипт от @DZgas(Telegram) - https://www.gate-dzgas.com/NEURAL-SORT.html
